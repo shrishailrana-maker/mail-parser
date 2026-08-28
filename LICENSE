@@ -1,0 +1,11 @@
+# License
+
+Copyright (c) 2020 Stalwart Labs LLC
+Copyright (c) 2026 Shrishail Rana, C# port
+
+The source code in this repository is licensed under either of the following licenses, at your option:
+
+- [Apache License 2.0](LICENSES/Apache-2.0.txt)
+- [MIT License](LICENSES/MIT.txt)
+
+The notices in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) identify the upstream Stalwart mail-parser source used for this C# port.

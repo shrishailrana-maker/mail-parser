@@ -1,5 +1,10 @@
-/target
-/test
-perf.*
-*.svg
-Cargo.lock
+# .NET build and test output
+[Bb]in/
+[Oo]bj/
+TestResults/
+*.trx
+
+# IDE and user state
+.vs/
+*.user
+*.suo

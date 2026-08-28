@@ -1,3 +1,9 @@
+mail-parser 0.11.8 (C# port)
+================================
+- Initial .NET 10 port of Stalwart mail-parser 0.11.8.
+- Preserved the public upstream fixtures and source attribution.
+- The upstream 0.11.8 entry and its full prior history follow unchanged.
+
 mail-parser 0.11.8
 ================================
 - Fix: `HeaderName` breaks rkyv serialization from <= 0.11.6.
