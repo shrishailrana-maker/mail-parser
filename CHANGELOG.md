@@ -16,6 +16,13 @@ mail-parser 0.11.8 (C# port)
 - Fix: `HeaderName.resent_cc()` intentionally kept reading the correct header, documented as a deliberate deviation from a real bug in pinned upstream Rust.
 - Removed unused `rkyv` zero-copy stub classes (no .NET equivalent to Rust's zero-copy technique; confirmed unused).
 - Wired up previously dead-code `BodyPartIterator`/`AttachmentIterator` to the actual public iteration API.
+- Fix: `remove_header()` used order-preserving removal instead of Rust's `swap_remove` (remaining header order could differ from upstream).
+- Fix: `header_raw()`/`headers_raw()` silently substituted replacement characters for invalid UTF-8 instead of matching Rust's strict decode-or-reject behavior.
+- Fix: `header_as(HeaderForm.URLs)` fell through to the wrong parser instead of routing through address parsing; `HeaderForm.Raw` now matches Rust's actual inline decode/trim logic instead of delegating to the wrong parser.
+- Fix: `DateTime.ToString()` returned an RFC822-formatted string; Rust's `Display` returns RFC3339.
+- Fix: `HeaderName` equality/hashing used broader Unicode case-folding instead of Rust's ASCII-only comparison.
+- Fix: `HeaderValue.len()` counted UTF-16 characters instead of UTF-8 bytes for address and content-type values.
+- Fix: `maildir` folder traversal did not match Rust's actual recursive, prefix-gated discovery algorithm.
 
 mail-parser 0.11.8
 ================================
