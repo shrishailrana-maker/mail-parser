@@ -3,6 +3,19 @@ mail-parser 0.11.8 (C# port)
 - Initial .NET 10 port of Stalwart mail-parser 0.11.8.
 - Preserved the public upstream fixtures and source attribution.
 - The upstream 0.11.8 entry and its full prior history follow unchanged.
+- Full Rust-to-C# source parity audit (all 44 file pairs, symbol-by-symbol) found and fixed ~30 behavioral divergences from upstream; see `PARITY-AUDIT.md` for complete findings and rationale.
+- Fix: `core/header.cs` was not actually a port of `header.rs` (held unrelated date-utility code instead); reorganized to hold the real `Header`/`HeaderValue`/`HeaderName`/`ContentType`/`Received`/`Host` API.
+- Fix: `as_text()`/`as_text_list()` returned the wrong `TextList` element (first instead of last), which affected `message_id()`, `content_id()`, and `return_address()`.
+- Fix: `return_address()` never actually fell back to the `From` header when `Return-Path` was absent.
+- Fix: several ASCII-only-vs-Unicode divergences in whitespace classification and case folding (7+ call sites).
+- Fix: `mbox` parsing silently stripped CRLF line endings from message content; date validity checking was too weak.
+- Fix: `maildir` accepted a folder missing either `cur/` or `new/`, and always used the wrong path separator.
+- Fix: `content_type` parsing fabricated a result on truncated input with no trailing newline.
+- Fix: quoted-printable decoding silently inserted recovery bytes on malformed input instead of signaling failure.
+- Fix: `Received` header parsing silently accepted IPv4 octets with leading zeros (a known octal-interpretation/SSRF-bypass ambiguity); now rejected.
+- Fix: `HeaderName.resent_cc()` intentionally kept reading the correct header, documented as a deliberate deviation from a real bug in pinned upstream Rust.
+- Removed unused `rkyv` zero-copy stub classes (no .NET equivalent to Rust's zero-copy technique; confirmed unused).
+- Wired up previously dead-code `BodyPartIterator`/`AttachmentIterator` to the actual public iteration API.
 
 mail-parser 0.11.8
 ================================
