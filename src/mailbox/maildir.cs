@@ -126,7 +126,14 @@ public class MaildirFolder : IEnumerable<MaildirMessage>
                         case 'D': flags.Add(MaildirFlag.Draft); break;
                         case 'F': flags.Add(MaildirFlag.Flagged); break;
                         default:
-                            if (!char.IsLetterOrDigit(ch)) goto flagDone;
+                            // Rust iterates filename BYTES and checks ch.is_ascii_alphanumeric()
+                            // -- ASCII only (0-9, A-Z, a-z), stops at the first non-ASCII-
+                            // alphanumeric byte. char.IsLetterOrDigit() is Unicode-aware and
+                            // returns true for non-ASCII letters (e.g. 'é'), so a suffix like
+                            // "2,XéF" continued past 'é' to incorrectly pick up 'F' (Flagged)
+                            // where Rust stops at 'é' and never sees the 'F' (PARITY-AUDIT.md;
+                            // Boss's own review caught this in the maildir.cs rewrite).
+                            if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))) goto flagDone;
                             break;
                     }
                 }
@@ -173,14 +180,23 @@ public class MaildirFolderIterator : IEnumerable<MaildirFolder>
     // name, never to decide whether to look at a directory at all -- confirmed wrong via
     // a concrete failing input (PARITY-AUDIT.md: a non-prefixed sibling directory with
     // its own cur/new was wrongly yielded in Maildir++ mode).
+    // Rust: FolderIterator::new() does `fs::read_dir(path)?` -- a missing or inaccessible
+    // root is a hard error at construction, not an empty result; read failures mid-
+    // traversal are likewise `Err`, not silently skipped (`Some(Err(err)) => return
+    // Some(Err(err))` in next()). This previously swallowed both cases into a silently
+    // empty enumeration (`if (!Directory.Exists(_rootPath)) yield break;` and a try/catch
+    // around the read in Walk()), making an inaccessible mailbox indistinguishable from
+    // "just empty" (PARITY-AUDIT.md; Boss's own review caught this in the maildir.cs
+    // rewrite). Fixed by removing both: a missing/inaccessible root or subdirectory now
+    // throws naturally (DirectoryNotFoundException / UnauthorizedAccessException) from
+    // Directory.EnumerateFileSystemEntries, the C#-idiomatic equivalent of Rust
+    // propagating a real error to the caller instead of yielding nothing.
     public IEnumerator<MaildirFolder> GetEnumerator()
     {
         if (Directory.Exists(_rootPath) && HasCurAndNew(_rootPath))
         {
             yield return new MaildirFolder(_rootPath, null);
         }
-
-        if (!Directory.Exists(_rootPath)) yield break;
 
         foreach (var folder in Walk(_rootPath, new List<string>()))
         {
@@ -190,10 +206,7 @@ public class MaildirFolderIterator : IEnumerable<MaildirFolder>
 
     private IEnumerable<MaildirFolder> Walk(string dirPath, List<string> nameStack)
     {
-        IEnumerable<string> entries;
-        try { entries = Directory.EnumerateFileSystemEntries(dirPath); }
-        catch (IOException) { yield break; }
-        catch (UnauthorizedAccessException) { yield break; }
+        var entries = Directory.EnumerateFileSystemEntries(dirPath);
 
         foreach (var entry in entries)
         {
@@ -434,6 +447,51 @@ public class maildir_tests
 
             Assert.IsTrue(names.Contains("Sent"), $"Expected 'Sent' to be found, got: {string.Join(", ", names)}");
             Assert.IsFalse(names.Contains("NotPrefixed"), $"'NotPrefixed' must be skipped entirely in Maildir++ mode, got: {string.Join(", ", names)}");
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public void missing_root_throws_instead_of_silently_empty_matches_rust()
+    {
+        // Rust: FolderIterator::new() does fs::read_dir(path)? -- a missing/inaccessible
+        // root is a hard error, not an empty result (PARITY-AUDIT.md; Boss's own review
+        // caught this in the maildir.cs rewrite -- the root-existence check and a
+        // try/catch in Walk() were silently swallowing this into an empty enumeration).
+        string missingRoot = Path.Combine(Path.GetTempPath(), "maildir_does_not_exist_" + Guid.NewGuid());
+        var it = new MaildirFolderIterator(missingRoot, ".");
+        Assert.ThrowsExactly<DirectoryNotFoundException>(() =>
+        {
+            foreach (var _ in it) { }
+        });
+    }
+
+    [TestMethod]
+    public void flag_parsing_stops_at_first_non_ascii_alphanumeric_byte_matches_rust()
+    {
+        // Rust iterates filename BYTES and checks ch.is_ascii_alphanumeric() -- ASCII
+        // only, stops at the first non-ASCII-alphanumeric byte. char.IsLetterOrDigit() is
+        // Unicode-aware and returns true for 'é', so a suffix like "2,XéF" continued past
+        // 'é' to incorrectly pick up the trailing 'F' (Flagged), where Rust stops parsing
+        // at 'é' and never reaches 'F' (PARITY-AUDIT.md; Boss's own review caught this in
+        // the maildir.cs rewrite -- exact case Boss traced by hand).
+        string root = Path.Combine(Path.GetTempPath(), "maildir_test_" + Guid.NewGuid());
+        try
+        {
+            string curDir = Path.Combine(root, "cur");
+            Directory.CreateDirectory(curDir);
+            Directory.CreateDirectory(Path.Combine(root, "new"));
+            File.WriteAllBytes(Path.Combine(curDir, "1234567890.host:2,XéF"), new byte[] { 98, 10 });
+
+            var folder = new MaildirFolder(root, null);
+            var messages = new List<MaildirMessage>();
+            foreach (var msg in folder) messages.Add(msg);
+
+            Assert.AreEqual(1, messages.Count);
+            Assert.IsFalse(messages[0].flags.Contains(MaildirFlag.Flagged), $"Flagged must NOT be set -- Rust stops at 'é', never reaches 'F'. Got: {string.Join(",", messages[0].flags)}");
         }
         finally
         {

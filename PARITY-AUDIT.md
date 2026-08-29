@@ -1,9 +1,60 @@
 # Rust → C# Source Parity Audit
 
 Upstream: stalwartlabs/mail-parser v0.11.8, commit `499ae0f2ff649af84c921af4b008f7c617b0bf87` (present in this repo as `HEAD~1`; Rust sources extracted from `git show 499ae0f:<path>`).
-Port: shrishailrana-maker/mail-parser. This file's earlier "FINAL STATUS / GO" claim below was committed as `96519a5`; a changelog update followed as `6c82bed`. **That GO claim was wrong for 9 items** — see the correction section immediately below, which supersedes it for those items specifically. Everything else in the older section still stands.
+Port: shrishailrana-maker/mail-parser. The 9-item correction round below was committed as `6577294`. **Boss's own follow-up review of that commit found 2 more real bugs, both introduced by the maildir.cs rewrite in that same round** — see the section immediately below, which supersedes the maildir portion of the 9-item round for these 2 specific points. Everything else in that round and the older "FINAL STATUS" section still stands.
 
-# CORRECTION ROUND — Boss's own independent line-by-line review of committed `96519a5` found 9 real bugs the prior "all resolved" status incorrectly claimed as fixed
+# SECOND CORRECTION ROUND — 2 bugs found in the committed `6577294` maildir.cs rewrite itself, both scoped fixes (not another rewrite)
+
+**What happened:** after the 9-item correction round was committed (`6577294`), Boss independently re-audited the `maildir.cs` traversal rewrite from that same commit and found 2 real bugs *in the rewrite* — not pre-existing findings that were missed, but new defects the rewrite itself introduced. Confirmed both via `grep` against the actual committed file before any fix was applied, same discipline as the prior round.
+
+**Final build + full test suite for this round:** `dotnet build` — 0 errors, 0 warnings. `dotnet test` — **88/88 passing** (86 going into this round + 2 new regression tests). `parse_full_messages` (107-EML / 214-JSON corpus) included and never broken. Git left completely untouched — no add, no commit, no push.
+
+## Item 1: `src/mailbox/maildir.cs` — missing/inaccessible directories silently swallowed into an empty enumeration
+
+Rust's `FolderIterator::new()` does `fs::read_dir(path)?` — a missing or inaccessible root is a hard error at construction, not an empty result; read failures mid-traversal are likewise propagated as `Err`, never silently skipped. The rewrite from the prior round had `if (!Directory.Exists(_rootPath)) yield break;` in `GetEnumerator()` and `catch (IOException) { yield break; }` / `catch (UnauthorizedAccessException) { yield break; }` around the read in `Walk()` — both made an inaccessible mailbox indistinguishable from "just empty."
+
+Fixed by removing both defensive catches entirely, letting `Directory.EnumerateFileSystemEntries` throw its natural .NET exception. Verified on disk after the fix:
+```
+    public IEnumerator<MaildirFolder> GetEnumerator()
+    {
+        if (Directory.Exists(_rootPath) && HasCurAndNew(_rootPath))
+        {
+            yield return new MaildirFolder(_rootPath, null);
+        }
+
+        foreach (var folder in Walk(_rootPath, new List<string>()))
+        {
+            yield return folder;
+        }
+    }
+
+    private IEnumerable<MaildirFolder> Walk(string dirPath, List<string> nameStack)
+    {
+        var entries = Directory.EnumerateFileSystemEntries(dirPath);
+```
+No `yield break` on missing root, no `try`/`catch` around the read. Regression test `missing_root_throws_instead_of_silently_empty_matches_rust`: points the iterator at a nonexistent path, asserts `DirectoryNotFoundException` via `Assert.ThrowsExactly`. Passing.
+
+## Item 2: `src/mailbox/maildir.cs` line ~129 — Unicode-aware flag-suffix parsing instead of ASCII-only
+
+Rust iterates the `cur`/`new` filename's `:2,FLAGS` suffix as raw bytes and checks `ch.is_ascii_alphanumeric()` — ASCII only (`0-9`, `A-Z`, `a-z`), stopping at the first byte outside that range. The rewrite used `char.IsLetterOrDigit(ch)`, which is Unicode-aware. Boss traced the exact failure by hand: for suffix `"2,XéF"`, Rust stops at the non-ASCII `é` and never reaches `F` (`Flagged` not set); C#'s `IsLetterOrDigit('é')` returns `true`, so parsing continued past it and incorrectly picked up `Flagged` from the trailing `F`.
+
+Fixed with a direct ASCII-range check, matching this codebase's established pattern (`HeaderExtensions.IsAsciiWhitespace`/`EqIgnoreAsciiCase`). Verified on disk after the fix:
+```
+                        default:
+                            if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))) goto flagDone;
+                            break;
+```
+Regression test `flag_parsing_stops_at_first_non_ascii_alphanumeric_byte_matches_rust`: a real maildir message file named with suffix `2,XéF`, asserts the parsed flags do **not** include `Flagged` (matching Rust stopping at `é`, where the unfixed code would have incorrectly included it). Passing.
+
+## Go/no-go for this round
+
+**GO for these 2 items.** Both fixed as small, scoped changes — not another broad rewrite, per instruction. Both verified against disk after the fix, both regression tests confirmed passing (and, for the flag-parsing case, the failure mode was hand-traceable and the fix directly addresses it; for the error-propagation case, the change is a straightforward removal of defensive swallowing, verified by the new test actually throwing). 88/88 total tests passing, 107-EML corpus intact, build clean. Git untouched.
+
+**Per instruction, stopping here** — Boss wants one final read-only audit pass over the whole codebase next (not another rewrite), to be briefed separately as its own step, not started proactively in this round.
+
+---
+
+# FIRST CORRECTION ROUND — Boss's own independent line-by-line review of committed `96519a5` found 9 real bugs the prior "all resolved" status incorrectly claimed as fixed
 
 **What happened:** the earlier FINAL STATUS section (below) claimed all findings were "fixed or confirmed-not-a-bug." Boss did his own independent comparison of the committed code against pinned Rust and found 9 items where that was false — the code on disk did not match what the document said. Spot-checked 3 independently before this round even started (`core/message.cs:44` still `RemoveAt`, lines 61/108 still unconditional `UTF8.GetString`) and confirmed real. **This means some earlier "DONE"/"GO" claims described intent, not verified reality** — a real process failure, not a one-off typo.
 
