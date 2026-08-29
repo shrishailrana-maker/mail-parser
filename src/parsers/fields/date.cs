@@ -470,6 +470,16 @@ public class date_tests
     }
 
     [TestMethod]
+    public void datetime_tostring_uses_rfc3339_not_rfc822_matches_rust()
+    {
+        // Rust: impl fmt::Display for DateTime -- self.to_rfc3339(). Was to_rfc822()
+        // (PARITY-AUDIT.md; Boss's own review caught this was never actually fixed).
+        var dt = new DateTime(2021, 11, 20, 14, 22, 1, true, 8, 0);
+        Assert.AreEqual(dt.to_rfc3339(), dt.ToString());
+        Assert.AreNotEqual(dt.to_rfc822(), dt.ToString());
+    }
+
+    [TestMethod]
     public void datetime_to_timezone()
     {
         var dt = new DateTime(2021, 1, 1, 0, 0, 0, false, 0, 0);

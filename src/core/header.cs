@@ -77,6 +77,16 @@ public static class HeaderExtensions
     internal static bool IsAsciiWhitespace(byte ch) =>
         ch == (byte)' ' || ch == (byte)'\t' || ch == (byte)'\n' || ch == 0x0C || ch == (byte)'\r';
 
+    // Rust: std::str::from_utf8(bytes).ok() -- None on ANY invalid UTF-8 byte, strict,
+    // no lossy replacement-character fallback. Shared here (moved from being private to
+    // MessagePart alone) since Message's header_raw()/headers_raw() need the identical
+    // strict decode and previously had no access to it (PARITY-AUDIT.md).
+    internal static string? TryUtf8(byte[] bytes)
+    {
+        try { return new System.Text.UTF8Encoding(false, throwOnInvalidBytes: true).GetString(bytes); }
+        catch (System.Text.DecoderFallbackException) { return null; }
+    }
+
     // Matches Rust's str::make_ascii_lowercase() / Cow::make_ascii_lowercase(): only
     // A-Z fold to a-z, every other character (including non-ASCII Unicode letters) is
     // left untouched. .NET's ToLowerInvariant() folds a much wider Unicode case-mapping
@@ -175,9 +185,12 @@ public abstract partial record HeaderValue
             _ => 0
         },
         DateTimeRecord => 24,
-        ContentTypeRecord ctr => ctr.Value.c_type.Length
-            + (ctr.Value.c_subtype?.Length ?? 0)
-            + (ctr.Value.attributes?.ConvertAll(a => a.name.Length + a.value.Length).FindAll(_ => true) is { } lens ? Sum(lens) : 0),
+        // Rust: ct.c_type.len() + c_subtype.len() + attributes' name.len()+value.len() --
+        // str::len() is UTF-8 BYTE length throughout, not C#'s UTF-16 string.Length. Was
+        // .Length everywhere here (PARITY-AUDIT.md; Boss's own review caught this).
+        ContentTypeRecord ctr => System.Text.Encoding.UTF8.GetByteCount(ctr.Value.c_type)
+            + (ctr.Value.c_subtype != null ? System.Text.Encoding.UTF8.GetByteCount(ctr.Value.c_subtype) : 0)
+            + (ctr.Value.attributes?.ConvertAll(a => System.Text.Encoding.UTF8.GetByteCount(a.name) + System.Text.Encoding.UTF8.GetByteCount(a.value)).FindAll(_ => true) is { } lens ? Sum(lens) : 0),
         ReceivedRecord => 1,
         _ => 0
     };
@@ -196,10 +209,17 @@ public abstract partial record HeaderValue
         return total;
     }
 
+    // Rust: a.name.len() + a.address.len() -- str::len() is UTF-8 BYTE length, not C#'s
+    // UTF-16 string.Length (differs for any non-ASCII character). Was .Length
+    // (PARITY-AUDIT.md; Boss's own review caught this).
     private static int SumAddr(List<Addr> addrs)
     {
         int total = 0;
-        foreach (var a in addrs) total += (a.name?.Length ?? 0) + (a.address?.Length ?? 0);
+        foreach (var a in addrs)
+        {
+            total += (a.name != null ? System.Text.Encoding.UTF8.GetByteCount(a.name) : 0)
+                + (a.address != null ? System.Text.Encoding.UTF8.GetByteCount(a.address) : 0);
+        }
         return total;
     }
 

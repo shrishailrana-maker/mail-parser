@@ -376,7 +376,12 @@ public partial struct DateTime : IEquatable<DateTime>, IComparable<DateTime>
 
     public string to_rfc822() => DateTimeUtils.ToRfc822(this);
     public string to_rfc3339() => DateTimeUtils.ToRfc3339(this);
-    public override string ToString() => to_rfc822();
+    // Rust: impl fmt::Display for DateTime { ... self.to_rfc3339() } (parsers/fields/date.rs:282-286)
+    // -- was to_rfc822(), a different format entirely. Confirmed no other code depends on
+    // the old format: DateTime has no [JsonConverter] and serializes to JSON via its own
+    // [JsonPropertyName] fields (year/month/day/...), not via ToString(), so this has no
+    // JSON-wire-format blast radius.
+    public override string ToString() => to_rfc3339();
 }
 
 // Rust: Host
@@ -1146,18 +1151,25 @@ public partial struct HeaderName : IEquatable<HeaderName>
 
     public static implicit operator HeaderName(string name) => HeaderNameUtils.ParseHeaderName(name);
 
+    // Rust: impl PartialEq for HeaderName -- Self::Other(a).eq_ignore_ascii_case(b), ASCII
+    // only. impl Hash -- iterates bytes, ASCII-lowercasing each before hashing. .NET's
+    // StringComparison.OrdinalIgnoreCase / StringComparer.OrdinalIgnoreCase fold a much
+    // wider Unicode case-mapping table (PARITY-AUDIT.md; Boss's own review caught this).
+    // Equals and GetHashCode are kept consistent with each other via the same
+    // ASCII-lowercase transform (equal-under-Equals values must hash identically -- a
+    // mismatch between the two would be its own separate bug class).
     public bool Equals(HeaderName other)
     {
         if (Kind != other.Kind) return false;
         if (Kind == KnownHeader.Other)
         {
-            return string.Equals(CustomName, other.CustomName, StringComparison.OrdinalIgnoreCase);
+            return HeaderExtensions.EqIgnoreAsciiCase(CustomName, other.CustomName ?? "");
         }
         return true;
     }
 
     public override bool Equals(object? obj) => obj is HeaderName hn && Equals(hn);
-    public override int GetHashCode() => Kind == KnownHeader.Other ? StringComparer.OrdinalIgnoreCase.GetHashCode(CustomName ?? "") : Kind.GetHashCode();
+    public override int GetHashCode() => Kind == KnownHeader.Other ? HeaderExtensions.ToAsciiLowercase(CustomName ?? "").GetHashCode(StringComparison.Ordinal) : Kind.GetHashCode();
     public static bool operator ==(HeaderName left, HeaderName right) => left.Equals(right);
     public static bool operator !=(HeaderName left, HeaderName right) => !left.Equals(right);
 

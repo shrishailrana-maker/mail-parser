@@ -41,7 +41,13 @@ public partial record Message : IMimeHeaders
             if (headers[i].name == header)
             {
                 var val = headers[i].value;
-                headers.RemoveAt(i);
+                // Rust: headers.swap_remove(pos) -- swaps the last element into the
+                // vacated slot instead of shifting everything down (RemoveAt), so
+                // remaining header order is NOT preserved. Confirmed against
+                // core/message.rs:38 (`headers.swap_remove(pos).value`).
+                int lastIdx = headers.Count - 1;
+                headers[i] = headers[lastIdx];
+                headers.RemoveAt(lastIdx);
                 return val;
             }
         }
@@ -58,12 +64,31 @@ public partial record Message : IMimeHeaders
         int end = (int)h.offset_end;
         if (start >= 0 && end <= raw_message.Length && start <= end)
         {
-            return System.Text.Encoding.UTF8.GetString(raw_message, start, end - start);
+            // Rust: std::str::from_utf8(...).ok() -- None on ANY invalid UTF-8 byte, not a
+            // lossy decode with replacement characters. Was UTF8.GetString (never fails).
+            return HeaderExtensions.TryUtf8(raw_message[start..end]);
         }
         return null;
     }
 
-    // Rust: Message::header_as
+    // Rust: Message::header_as (core/message.rs:50-80). Rewritten to match exactly:
+    // - HeaderForm::URLs was falling through to the C# wildcard (parse_raw()); Rust has an
+    //   explicit arm routing it through parse_address(), same as Addresses/GroupedAddresses.
+    // - HeaderForm::Raw is NOT a call to any parse_raw-named function in Rust -- it's
+    //   inline: strict UTF-8 decode with unwrap_or_default() (empty string, not lossy
+    //   replacement chars, on invalid UTF-8), then .trim() (Rust's default str::trim()
+    //   trims full Unicode whitespace, matching .NET's parameterless string.Trim() -- no
+    //   ASCII-vs-Unicode divergence risk here, unlike other trim/whitespace sites in this
+    //   audit), wrapped as HeaderValue::Text. Was calling parsers/fields/raw.cs's
+    //   parse_raw() instead, which has different parser-state-machine-based semantics.
+    // - An out-of-bounds offset range (self.raw_message.get(range) failing) maps to
+    //   HeaderValue::Empty via .map_or(...) in Rust -- Rust ALWAYS pushes one result per
+    //   matching header, never skips. C# was skipping the header entirely instead of
+    //   pushing Empty when the range check failed (found while re-reading Rust's actual
+    //   code for this fix, not previously tracked as its own finding).
+    // - No wildcard arm: Rust's match is exhaustive over all 7 HeaderForm variants: this
+    //   C# switch now is too, so a future 8th enum value would fail to compile here rather
+    //   than silently falling through, matching Rust's own exhaustiveness guarantee.
     public List<HeaderValue> header_as(HeaderName header, HeaderForm form)
     {
         var results = new List<HeaderValue>();
@@ -76,16 +101,22 @@ public partial record Message : IMimeHeaders
                 int end = (int)h.offset_end;
                 if (start >= 0 && end <= raw_message.Length && start <= end)
                 {
-                    var stream = new MessageStream(new ReadOnlyMemory<byte>(raw_message, start, end - start));
+                    byte[] bytes = raw_message[start..end];
                     results.Add(form switch
                     {
-                        HeaderForm.Raw => stream.parse_raw(),
-                        HeaderForm.Text => stream.parse_unstructured(),
-                        HeaderForm.Addresses or HeaderForm.GroupedAddresses => stream.parse_address(),
-                        HeaderForm.MessageIds => stream.parse_id(),
-                        HeaderForm.Date => stream.parse_date(),
-                        _ => stream.parse_raw(),
+                        HeaderForm.Raw => HeaderValue.Text((HeaderExtensions.TryUtf8(bytes) ?? "").Trim()),
+                        HeaderForm.Text => new MessageStream(bytes).parse_unstructured(),
+                        HeaderForm.Addresses => new MessageStream(bytes).parse_address(),
+                        HeaderForm.GroupedAddresses => new MessageStream(bytes).parse_address(),
+                        HeaderForm.MessageIds => new MessageStream(bytes).parse_id(),
+                        HeaderForm.Date => new MessageStream(bytes).parse_date(),
+                        HeaderForm.URLs => new MessageStream(bytes).parse_address(),
+                        _ => throw new ArgumentOutOfRangeException(nameof(form), form, null), // Rust's enum cannot hold an invalid discriminant; this arm exists only for C#'s weaker enum type safety, not a real case
                     });
+                }
+                else
+                {
+                    results.Add(HeaderValue.Empty);
                 }
             }
         }
@@ -105,8 +136,15 @@ public partial record Message : IMimeHeaders
             int end = (int)header.offset_end;
             if (start >= 0 && end <= raw_message.Length && start <= end)
             {
-                string val = System.Text.Encoding.UTF8.GetString(raw_message, start, end - start);
-                yield return (header.name.as_str(), val);
+                // Rust: filter_map(|h| ... std::str::from_utf8(...).ok() ...) -- a header
+                // with invalid UTF-8 is DROPPED from the sequence entirely (not yielded
+                // with a null/replacement value). Was UTF8.GetString (never fails, always
+                // yielded).
+                string? val = HeaderExtensions.TryUtf8(raw_message[start..end]);
+                if (val != null)
+                {
+                    yield return (header.name.as_str(), val);
+                }
             }
         }
     }
@@ -403,17 +441,12 @@ public partial record MessagePart : IMimeHeaders
     {
         PartType.TextRecord tr => tr.Value,
         PartType.HtmlRecord hr => hr.Value,
-        PartType.BinaryRecord br => TryUtf8(br.Value),
-        PartType.InlineBinaryRecord ibr => TryUtf8(ibr.Value),
-        PartType.MessageRecord mr => TryUtf8(mr.Value.raw_message_bytes()),
+        PartType.BinaryRecord br => HeaderExtensions.TryUtf8(br.Value),
+        PartType.InlineBinaryRecord ibr => HeaderExtensions.TryUtf8(ibr.Value),
+        PartType.MessageRecord mr => HeaderExtensions.TryUtf8(mr.Value.raw_message_bytes()),
         _ => null,
     };
 
-    private static string? TryUtf8(byte[] bytes)
-    {
-        try { return new UTF8Encoding(false, throwOnInvalidBytes: true).GetString(bytes); }
-        catch (DecoderFallbackException) { return null; }
-    }
 
     // Rust: MessagePart::sub_parts -- same data as multipart(), under Rust's actual name
     // (FILE 1 missing-symbol list; multipart() already existed under a different name).
@@ -475,6 +508,134 @@ public partial record MessagePart : IMimeHeaders
 public class message_core_tests
 {
     // Regression tests for Phase 2 fixes -- each pins a Rust-verified expected value.
+
+    [TestMethod]
+    public void remove_header_uses_swap_remove_order_matches_rust()
+    {
+        // Rust: headers.swap_remove(pos) -- swaps the LAST element into the removed slot
+        // instead of shifting everything down (RemoveAt), so remaining order is NOT
+        // preserved. Headers [A, B(target), C, D], remove B -> Rust order is [A, D, C]
+        // (D swapped into B's slot), not [A, C, D] (PARITY-AUDIT.md, Boss's own
+        // independent review caught this was never actually fixed despite being logged
+        // as part of the earlier "4 methods" DONE entry).
+        byte[] raw = System.Text.Encoding.UTF8.GetBytes(
+            "X-A: a\r\nX-B: b\r\nX-C: c\r\nX-D: d\r\n\r\nbody\r\n");
+        var msg = new MessageParser().parse(raw);
+        Assert.IsNotNull(msg);
+        var removed = msg!.remove_header("X-B");
+        Assert.IsNotNull(removed);
+
+        var remainingNames = msg.headers().Select(h => h.name.as_str()).ToList();
+        CollectionAssert.AreEqual(new[] { "X-A", "X-D", "X-C" }, remainingNames);
+    }
+
+    [TestMethod]
+    public void header_value_len_uses_utf8_bytes_for_address_and_content_type_matches_rust()
+    {
+        // Rust: HeaderValue::len() for Address sums a.name.len() + a.address.len(), and
+        // for ContentType sums c_type.len() + c_subtype.len() + attribute name/value
+        // lens -- all str::len() (UTF-8 BYTE length). Was C#'s string.Length (UTF-16 code
+        // units) throughout both cases, which differs for any non-ASCII character
+        // (PARITY-AUDIT.md; Boss's own review caught this).
+        // "café" = 4 UTF-16 chars but 5 UTF-8 bytes ('é' is U+00E9, 2 bytes) -- a
+        // discriminating value where the two counting methods disagree.
+        var addrValue = HeaderValue.Address(Address.List(new List<Addr> { new Addr("café", "a@b") }));
+        Assert.AreEqual(5 + 3, addrValue.len()); // "café"=5 bytes, "a@b"=3 bytes
+
+        var ctValue = HeaderValue.ContentType(new ContentType("text", "café",
+            new List<Attribute> { new Attribute("name", "café") }));
+        // c_type "text"=4, c_subtype "café"=5, attribute name "name"=4 + value "café"=5
+        Assert.AreEqual(4 + 5 + (4 + 5), ctValue.len());
+    }
+
+    [TestMethod]
+    public void header_raw_returns_null_for_invalid_utf8_matches_rust()
+    {
+        // Rust: std::str::from_utf8(...).ok() -- None on ANY invalid UTF-8 byte in the
+        // header's raw range (PARITY-AUDIT.md; Boss's own review caught this was still
+        // UTF8.GetString, never fails, despite being logged as fixed).
+        byte[] raw = System.Text.Encoding.UTF8.GetBytes("X-Test: ")
+            .Concat(new byte[] { 0xFF, 0xFE }) // 0xFF is never valid in any UTF-8 position
+            .Concat(System.Text.Encoding.UTF8.GetBytes("\r\n\r\nbody\r\n"))
+            .ToArray();
+        var msg = new MessageParser().parse(raw);
+        Assert.IsNotNull(msg);
+        Assert.IsNull(msg!.header_raw("X-Test"));
+
+        // Sanity: a normal valid-UTF8 header must still work.
+        byte[] validRaw = System.Text.Encoding.UTF8.GetBytes("X-Test: hello\r\n\r\nbody\r\n");
+        var validMsg = new MessageParser().parse(validRaw);
+        Assert.IsNotNull(validMsg!.header_raw("X-Test"));
+    }
+
+    [TestMethod]
+    public void headers_raw_drops_invalid_utf8_entry_entirely_matches_rust()
+    {
+        // Rust: filter_map(|h| ... .ok() ...) -- a header with invalid UTF-8 is DROPPED
+        // from the sequence entirely, not yielded with a replacement-char value and not
+        // yielded as null either. Valid headers must still appear.
+        byte[] raw = System.Text.Encoding.UTF8.GetBytes("X-Good: fine\r\nX-Bad: ")
+            .Concat(new byte[] { 0xFF, 0xFE })
+            .Concat(System.Text.Encoding.UTF8.GetBytes("\r\n\r\nbody\r\n"))
+            .ToArray();
+        var msg = new MessageParser().parse(raw);
+        Assert.IsNotNull(msg);
+        var names = msg!.headers_raw().Select(h => h.name).ToList();
+        CollectionAssert.Contains(names, "X-Good");
+        CollectionAssert.DoesNotContain(names, "X-Bad");
+    }
+
+    [TestMethod]
+    public void header_as_urls_form_routes_through_parse_address_matches_rust()
+    {
+        // Rust: HeaderForm::URLs => MessageStream::new(bytes).parse_address() -- an
+        // explicit arm; was falling through to the C# wildcard (parse_raw()) instead.
+        byte[] raw = System.Text.Encoding.UTF8.GetBytes("X-Url: <http://example.com>\r\n\r\nbody\r\n");
+        var msg = new MessageParser().parse(raw);
+        Assert.IsNotNull(msg);
+        var results = msg!.header_as("X-Url", HeaderForm.URLs);
+        Assert.AreEqual(1, results.Count);
+        Assert.IsTrue(results[0] is HeaderValue.AddressRecord, $"expected AddressRecord, got {results[0].GetType().Name}");
+    }
+
+    [TestMethod]
+    public void header_as_raw_form_matches_rust_inline_logic()
+    {
+        // Rust: HeaderForm::Raw is NOT a call to parse_raw() -- it's inline
+        // std::str::from_utf8(bytes).unwrap_or_default().trim(), wrapped as Text. Was
+        // calling parsers/fields/raw.cs's parse_raw(), a different parser-state-machine
+        // with different semantics.
+        byte[] raw = System.Text.Encoding.UTF8.GetBytes("X-Test:   hello world  \r\n\r\nbody\r\n");
+        var msg = new MessageParser().parse(raw);
+        Assert.IsNotNull(msg);
+        var results = msg!.header_as("X-Test", HeaderForm.Raw);
+        Assert.AreEqual(1, results.Count);
+        Assert.IsTrue(results[0] is HeaderValue.TextRecord, $"expected TextRecord, got {results[0].GetType().Name}");
+        Assert.AreEqual("hello world", ((HeaderValue.TextRecord)results[0]).Value);
+    }
+
+    [TestMethod]
+    public void header_name_equality_is_ascii_only_not_unicode_matches_rust()
+    {
+        // Rust: eq_ignore_ascii_case / hash-of-ascii-lowercased-bytes -- ASCII only. U+212A
+        // (KELVIN SIGN) is Unicode case-fold-equivalent to 'k'/'K' under .NET's
+        // OrdinalIgnoreCase, but must NOT be treated as equal to 'K' under ASCII-only
+        // rules (same style of test as the Kelvin-sign case used elsewhere in this audit
+        // for content_type.cs; PARITY-AUDIT.md, Boss's own review caught this).
+        // Constructed via HeaderName.Other(...) directly (not the implicit string
+        // conversion) to isolate Equals/GetHashCode from the separate strict
+        // character-class validation that conversion applies.
+        HeaderName withK = HeaderName.Other("X-TEMPK");
+        HeaderName withKelvin = HeaderName.Other("X-TEMPK"); // Kelvin sign, not ASCII 'K'
+        Assert.AreNotEqual(withK, withKelvin);
+
+        // Equals and GetHashCode must stay consistent with each other: a genuinely-equal
+        // pair (differing only by ASCII case) must still hash identically.
+        HeaderName upper = HeaderName.Other("X-CUSTOM");
+        HeaderName lower = HeaderName.Other("x-custom");
+        Assert.AreEqual(upper, lower);
+        Assert.AreEqual(upper.GetHashCode(), lower.GetHashCode());
+    }
 
     [TestMethod]
     public void header_values_returns_all_matching_headers_matches_rust()

@@ -157,40 +157,83 @@ public class MaildirFolderIterator : IEnumerable<MaildirFolder>
         _prefix = prefix;
     }
 
+    // Rust's real algorithm (maildir.rs:112-177), not a flat single-level scan: a
+    // depth-first walk using an explicit directory-handle stack + name-segment stack. At
+    // EVERY level (root included): a directory named "cur"/"new"/"tmp" is skipped. If a
+    // prefix is configured (Maildir++ mode), a directory whose name does NOT start with
+    // that prefix is skipped ENTIRELY -- not recursed into, not checked for cur/new, not
+    // yielded (`name.strip_prefix(prefix)` returns None, the guard fails). If no prefix
+    // is configured (Dovecot LAYOUT=fs), every directory name is used as-is with no
+    // filtering, and recursion is unconditional. A directory that qualifies by name is
+    // ALWAYS recursed into, whether or not it itself turns out to have valid cur+new --
+    // Rust pushes the read_dir handle before attempting MessageIterator::new_, so a
+    // maildir folder can be nested inside a non-maildir directory. The previous C#
+    // implementation used SearchOption.AllDirectories (recurses everywhere regardless of
+    // naming convention) and only used the prefix to STRIP an already-found folder's
+    // name, never to decide whether to look at a directory at all -- confirmed wrong via
+    // a concrete failing input (PARITY-AUDIT.md: a non-prefixed sibling directory with
+    // its own cur/new was wrongly yielded in Maildir++ mode).
     public IEnumerator<MaildirFolder> GetEnumerator()
     {
-        yield return new MaildirFolder(_rootPath, null);
+        if (Directory.Exists(_rootPath) && HasCurAndNew(_rootPath))
+        {
+            yield return new MaildirFolder(_rootPath, null);
+        }
 
         if (!Directory.Exists(_rootPath)) yield break;
 
-        var subdirs = Directory.GetDirectories(_rootPath, "*", SearchOption.AllDirectories);
-        foreach (var dir in subdirs)
+        foreach (var folder in Walk(_rootPath, new List<string>()))
         {
-            string dirName = Path.GetFileName(dir);
-            if (dirName is "cur" or "new" or "tmp") continue;
-
-            // Rust: MessageIterator::new_ requires BOTH 'cur' and 'new' to exist (each
-            // missing one independently returns Err(NotFound)) -- this used to accept
-            // either one alone, a confirmed bug (PARITY-AUDIT.md FILE 13).
-            if (Directory.Exists(Path.Combine(dir, "cur")) && Directory.Exists(Path.Combine(dir, "new")))
-            {
-                string rel = Path.GetRelativePath(_rootPath, dir);
-                if (_prefix != null && rel.StartsWith(_prefix))
-                {
-                    rel = rel.Substring(_prefix.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                }
-                // Rust: self.name_stack.join(self.prefix.unwrap_or("/")) -- the join
-                // separator is the configured prefix, or "/" when none was given (the
-                // documented LAYOUT=fs / Dovecot mode). This used to always use "."
-                // regardless of prefix, a confirmed bug (PARITY-AUDIT.md FILE 13).
-                string sep = _prefix ?? "/";
-                string folderName = rel.Replace(Path.DirectorySeparatorChar.ToString(), sep)
-                                        .Replace(Path.AltDirectorySeparatorChar.ToString(), sep);
-                if (_prefix != null && folderName.StartsWith(sep)) folderName = folderName.Substring(sep.Length);
-                yield return new MaildirFolder(dir, folderName);
-            }
+            yield return folder;
         }
     }
+
+    private IEnumerable<MaildirFolder> Walk(string dirPath, List<string> nameStack)
+    {
+        IEnumerable<string> entries;
+        try { entries = Directory.EnumerateFileSystemEntries(dirPath); }
+        catch (IOException) { yield break; }
+        catch (UnauthorizedAccessException) { yield break; }
+
+        foreach (var entry in entries)
+        {
+            if (!Directory.Exists(entry)) continue; // Rust: path.is_dir()
+
+            string name = Path.GetFileName(entry);
+            if (name is "cur" or "new" or "tmp") continue;
+
+            string segment;
+            if (_prefix != null)
+            {
+                if (!name.StartsWith(_prefix, StringComparison.Ordinal)) continue; // Rust: strip_prefix -> None -> skip entirely
+                segment = name.Substring(_prefix.Length);
+            }
+            else
+            {
+                segment = name;
+            }
+
+            nameStack.Add(segment);
+
+            if (HasCurAndNew(entry))
+            {
+                string sep = _prefix ?? "/";
+                yield return new MaildirFolder(entry, string.Join(sep, nameStack));
+            }
+
+            foreach (var sub in Walk(entry, nameStack))
+            {
+                yield return sub;
+            }
+
+            nameStack.RemoveAt(nameStack.Count - 1);
+        }
+    }
+
+    // Rust: MessageIterator::new_ requires BOTH 'cur' and 'new' to exist (each missing
+    // one independently returns Err(NotFound)) -- this used to accept either one alone.
+    private static bool HasCurAndNew(string path) =>
+        Directory.Exists(Path.Combine(path, "cur")) && Directory.Exists(Path.Combine(path, "new"));
 
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 }
@@ -353,6 +396,44 @@ public class maildir_tests
             foreach (var folder in it) names.Add(folder.name);
 
             Assert.IsTrue(names.Contains("Work/Projects"), $"Expected 'Work/Projects', got: {string.Join(", ", names)}");
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public void non_prefixed_sibling_skipped_entirely_in_maildir_plusplus_mode_matches_rust()
+    {
+        // Rust (maildir.rs:136-152): when a prefix IS configured (Maildir++ mode), a
+        // directory name that does NOT start with the prefix causes `strip_prefix` to
+        // return None -- the `if let Some(name) = ...` guard fails, so that directory is
+        // skipped ENTIRELY: not recursed into, not checked for cur/new, not yielded.
+        // C#'s SearchOption.AllDirectories recursive walk finds cur/new anywhere in the
+        // tree regardless of naming convention, only using the prefix to STRIP text from
+        // an already-found folder's name -- it doesn't use the prefix to decide whether
+        // to look at a directory at all. This is the real architectural divergence Phase 1
+        // flagged as "needs a concrete failing input" -- this is that input.
+        string root = Path.Combine(Path.GetTempPath(), "maildir_test_" + Guid.NewGuid());
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "cur"));
+            Directory.CreateDirectory(Path.Combine(root, "new"));
+            // A real Maildir++ sibling (dot-prefixed) -- must be found.
+            Directory.CreateDirectory(Path.Combine(root, ".Sent", "cur"));
+            Directory.CreateDirectory(Path.Combine(root, ".Sent", "new"));
+            // A directory with a valid cur/new shape but WITHOUT the "." prefix -- Rust
+            // skips this entirely in Maildir++ mode; it is not a Maildir++ sibling.
+            Directory.CreateDirectory(Path.Combine(root, "NotPrefixed", "cur"));
+            Directory.CreateDirectory(Path.Combine(root, "NotPrefixed", "new"));
+
+            var it = new MaildirFolderIterator(root, ".");
+            var names = new List<string?>();
+            foreach (var folder in it) names.Add(folder.name);
+
+            Assert.IsTrue(names.Contains("Sent"), $"Expected 'Sent' to be found, got: {string.Join(", ", names)}");
+            Assert.IsFalse(names.Contains("NotPrefixed"), $"'NotPrefixed' must be skipped entirely in Maildir++ mode, got: {string.Join(", ", names)}");
         }
         finally
         {
