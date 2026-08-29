@@ -39,7 +39,10 @@ public partial class MessageStream
                     return true;
                 }
                 if (!pk.HasValue) return false;
-                if (!char.IsWhiteSpace((char)pk.Value))
+                // Rust: is_ascii_whitespace() -- ASCII-only, unlike char.IsWhiteSpace which
+                // also treats 0x0B (vertical tab) and other Unicode whitespace as blank
+                // (PARITY-AUDIT.md: confirmed via independent cross-check at this exact line).
+                if (!HeaderExtensions.IsAsciiWhitespace(pk.Value))
                 {
                     break;
                 }
@@ -144,7 +147,9 @@ public partial class MessageStream
             }
             else
             {
-                if (!char.IsWhiteSpace((char)ch))
+                // Rust: is_ascii_whitespace() -- ASCII-only (PARITY-AUDIT.md: confirmed via
+                // independent cross-check at this exact line, same 0x0B divergence as above).
+                if (!HeaderExtensions.IsAsciiWhitespace(ch))
                 {
                     if (token_start == 0)
                     {

@@ -172,6 +172,18 @@ public class ReceivedTokenizer
         this.stream = stream;
     }
 
+    // Security-motivated improvement over both Rust and .NET's default leniency in one
+    // respect (see the call site's comment for the full rationale): true independent of
+    // .NET's own accept-and-normalize behavior for a leading-zero octet like "010".
+    private static bool HasLeadingZeroOctet(string text)
+    {
+        foreach (var part in text.Split('.'))
+        {
+            if (part.Length > 1 && part[0] == '0') return true;
+        }
+        return false;
+    }
+
     public ReceivedTokenData? peek()
     {
         if (peeked.HasValue) return peeked;
@@ -420,7 +432,22 @@ public class ReceivedTokenizer
 
         if (n_alpha == 0 && n_digit is >= 4 and <= 12 && n_hex == 0 && n_dot == 3 && n_at == 0 && n_other == 0 && n_colon == 0 && n_plus == 0 && n_minus == 0 && n_utf == 0)
         {
-            token = IPAddress.TryParse(text, out var ip) && ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? new ReceivedToken(ip) : ReceivedToken.Text;
+            // .NET's IPAddress.TryParse accepts leading-zero octets ("010.0.0.1" -> parses,
+            // silently dropping the zero) where Rust's Ipv4Addr::from_str rejects them --
+            // confirmed empirically by building and running a throwaway Rust program against
+            // this exact std method (rustc 1.97.1, the toolchain available in this
+            // environment; no rust-toolchain.toml pins a different version in this repo) --
+            // see PARITY-AUDIT.md for the transcript. Per Boss: this is fixed to the SAFER
+            // behavior regardless of which way Rust happened to go (it happens to agree
+            // here) -- leading-zero IP octets are a known ambiguity some parsers have
+            // historically read as octal, which has been used for SSRF/ACL-bypass tricks
+            // (e.g. "0177.0.0.1" as a disguised 127.0.0.1). Rejecting outright, not
+            // silently normalizing, is the defensible choice for a security-relevant
+            // Received-header parser independent of upstream's behavior.
+            token = IPAddress.TryParse(text, out var ip)
+                && ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                && !HasLeadingZeroOctet(text)
+                ? new ReceivedToken(ip) : ReceivedToken.Text;
         }
         else if ((n_alpha == 0 && n_hex is >= 1 and <= 32 && n_dot == 0 && n_at == 0 && n_other == 0 && n_colon >= 2 && n_plus == 0 && n_minus == 0 && n_utf == 0)
             || (n_alpha == 0 && n_digit is >= 1 and <= 32 && n_dot == 0 && n_at == 0 && n_other == 0 && n_colon >= 2 && n_plus == 0 && n_minus == 0 && n_utf == 0)
@@ -1094,6 +1121,28 @@ public class received_tests
             var r = res.as_received();
             Assert.AreEqual(test.expected, r, $"Failed for {test.header}");
         }
+    }
+
+    [TestMethod]
+    public void ipv4_leading_zero_octet_rejected_security_fix()
+    {
+        // Security-motivated fix, independent of Rust parity (though confirmed to match
+        // Rust's Ipv4Addr::from_str too -- see PARITY-AUDIT.md): a leading-zero IPv4 octet
+        // like "010" must NOT be recognized as an IP address token. Some parsers have
+        // historically read such octets as octal (e.g. "0177.0.0.1" as a disguised
+        // 127.0.0.1), which has been used for SSRF/ACL-bypass tricks. Confirms it now
+        // falls through to being treated as a plain hostname/name instead of a parsed IP.
+        var stream = new MessageStream(System.Text.Encoding.UTF8.GetBytes("from [010.0.0.1]\r\n"));
+        var result = stream.parse_received().as_received();
+        Assert.IsNotNull(result);
+        Assert.IsTrue(result!.from is Host.NameRecord, $"expected NameRecord, got {result.from?.GetType().Name}");
+        Assert.AreEqual("010.0.0.1", ((Host.NameRecord)result.from!).Value);
+
+        // Sanity: a normal, non-leading-zero IP must still parse as an actual IP address.
+        var stream2 = new MessageStream(System.Text.Encoding.UTF8.GetBytes("from [10.0.0.1]\r\n"));
+        var result2 = stream2.parse_received().as_received();
+        Assert.IsNotNull(result2);
+        Assert.IsTrue(result2!.from is Host.IpAddrRecord, $"expected IpAddrRecord, got {result2.from?.GetType().Name}");
     }
 
     [TestMethod]

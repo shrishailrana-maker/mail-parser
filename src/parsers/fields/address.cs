@@ -13,6 +13,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 
 #if STALWART_PORT_TESTS
@@ -59,6 +60,12 @@ public static class AddressParserUtils
 
     public static string? parse_address_user_part(string addr)
     {
+        // Rust's outer loop has an `else if !ch.is_ascii() { return None; }` arm that was
+        // missing here entirely -- non-ASCII bytes before any '+'/'@' silently fell through
+        // instead of aborting the parse (PARITY-AUDIT.md: found during the AddressParser
+        // full-depth read). Note Rust's INNER scan (after a '+') has no such check either,
+        // by design -- only the outer loop checks ASCII-ness, so this fix must not add the
+        // check inside the inner for-loop below.
         for (int pos = 0; pos < addr.Length; pos++)
         {
             char ch = addr[pos];
@@ -80,27 +87,41 @@ public static class AddressParserUtils
             {
                 return (pos > 0 && pos + 1 < addr.Length) ? addr.Substring(0, pos) : null;
             }
+            else if (ch > 127)
+            {
+                return null;
+            }
         }
         return null;
     }
 
+    // Rust: parse_address_detail_part -- fixed (PARITY-AUDIT.md cross-check #5): Rust
+    // tracks the LAST '+' seen (unconditionally overwriting plus_pos on every '+'), and
+    // allows an empty detail (a '+' immediately before '@'). The prior version here
+    // locked onto the FIRST '+' via a nested loop and required at least one character
+    // between '+' and '@', which is a different, wrong function: for
+    // "user+a+detail@x", Rust returns "detail" (after the last '+'); the prior code
+    // returned "a+detail" (after the first '+', engulfing the second '+' as text).
     public static string? parse_address_detail_part(string addr)
     {
+        int plus_pos = -1; // -1 == Rust's usize::MAX sentinel (no '+' seen yet)
         for (int pos = 0; pos < addr.Length; pos++)
         {
             char ch = addr[pos];
             if (ch == '+')
             {
-                if (pos > 0)
+                plus_pos = pos + 1;
+            }
+            else if (ch == '@')
+            {
+                if (plus_pos != -1 && pos + 1 < addr.Length)
                 {
-                    for (int p2 = pos + 1; p2 < addr.Length; p2++)
-                    {
-                        if (addr[p2] == '@' && p2 > pos + 1)
-                        {
-                            return addr.Substring(pos + 1, p2 - pos - 1);
-                        }
-                    }
+                    return addr.Substring(plus_pos, pos - plus_pos);
                 }
+                return null;
+            }
+            else if (ch > 127)
+            {
                 return null;
             }
         }
@@ -211,7 +232,12 @@ public partial class MessageStream
             {
                 string name = concat_tokens(name_tokens);
                 string comment = concat_tokens(comment_tokens);
-                if (!name.Contains(' ') && !name.Contains('\t'))
+                // Rust: !name.chars().any(char::is_whitespace) -- full Unicode whitespace
+                // (e.g. non-breaking space U+00A0), not just ASCII space/tab. A name built
+                // from a decoded RFC2047 token or unusual quoted content can contain other
+                // Unicode whitespace with no literal space/tab present, which took the wrong
+                // branch here (PARITY-AUDIT.md: found during the AddressParser full-depth read).
+                if (!name.Any(char.IsWhiteSpace))
                 {
                     addresses.Add(new Addr(comment, name));
                 }
@@ -523,6 +549,45 @@ public class address_tests
                 }
             }
         }
+    }
+
+    [TestMethod]
+    public void parse_address_detail_part_uses_last_plus_matches_rust()
+    {
+        // Rust: tracks the LAST '+', not the first (PARITY-AUDIT.md cross-check #5).
+        Assert.AreEqual("detail", AddressParserUtils.parse_address_detail_part("user+a+detail@example.com"));
+        // Rust: an empty detail (a '+' immediately before '@') is valid, not rejected.
+        Assert.AreEqual("", AddressParserUtils.parse_address_detail_part("user+@example.com"));
+    }
+
+    [TestMethod]
+    public void parse_address_user_part_rejects_non_ascii_matches_rust()
+    {
+        // Rust's outer loop has `else if !ch.is_ascii() { return None; }` -- was missing
+        // here entirely, so a non-ASCII byte before '+'/'@' silently passed through instead
+        // of aborting (PARITY-AUDIT.md: found during the AddressParser full-depth read).
+        Assert.IsNull(AddressParserUtils.parse_address_user_part("usér@example.com"));
+        // Sanity: pure-ASCII input must still work normally.
+        Assert.AreEqual("user", AddressParserUtils.parse_address_user_part("user@example.com"));
+        Assert.AreEqual("user", AddressParserUtils.parse_address_user_part("user+detail@example.com"));
+    }
+
+    [TestMethod]
+    public void add_address_uses_full_unicode_whitespace_check_matches_rust()
+    {
+        // Rust: !name.chars().any(char::is_whitespace) -- full Unicode whitespace (e.g.
+        // U+00A0 non-breaking space), not just ASCII space/tab. A name with a non-breaking
+        // space and no literal space/tab used to take the WRONG branch here (treated as a
+        // bare address with the comment as its name), instead of Rust's "name (comment)"
+        // combined-name branch (PARITY-AUDIT.md: found during the AddressParser full-depth read).
+        string header = "First Last (comment text)";
+        var stream = new MessageStream(System.Text.Encoding.UTF8.GetBytes(header));
+        var parsed = stream.parse_address().as_address();
+        Assert.IsNotNull(parsed);
+        var list = parsed!.into_list();
+        Assert.AreEqual(1, list.Count);
+        Assert.AreEqual("First Last (comment text)", list[0].name);
+        Assert.IsNull(list[0].address);
     }
 }
 #endif

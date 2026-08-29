@@ -95,7 +95,7 @@ public partial class MessageStream
                 string attr = System.Text.Encoding.UTF8.GetString(bytes);
                 if (!is_lower_case)
                 {
-                    attr = attr.ToLowerInvariant();
+                    attr = HeaderExtensions.ToAsciiLowercase(attr);
                     is_lower_case = true;
                 }
 
@@ -523,33 +523,14 @@ public partial class MessageStream
             }
         }
 
-        switch (parser.state)
-        {
-            case ContentState.Type:
-            case ContentState.AttributeName:
-            case ContentState.SubType:
-                parser.add_attribute(this);
-                break;
-            case ContentState.AttributeValue:
-            case ContentState.AttributeQuotedValue:
-                parser.add_value(this);
-                break;
-        }
-
-        if (parser.continuations != null)
-        {
-            parser.merge_continuations();
-        }
-
-        if (parser.c_type != null)
-        {
-            return HeaderValue.ContentType(new ContentType(
-                parser.c_type,
-                parser.c_subtype,
-                parser.attributes.Count > 0 ? parser.attributes : null
-            ));
-        }
-
+        // Rust's loop only ever returns a real ContentType from inside the '\n' match arm
+        // (when a trailing newline is actually seen); if the loop exits because input ran
+        // out first, Rust falls straight through to Empty here -- no finalization of
+        // whatever was in progress. The finalization block that used to be here (fixing up
+        // the in-progress attribute/value and returning a real ContentType anyway) had no
+        // Rust counterpart and was a confirmed bug (PARITY-AUDIT.md FILE 15): parsing the
+        // literal bytes "text/plain" with no trailing newline must return Empty, not a
+        // fabricated ContentType{c_type:"text", c_subtype:"plain"}.
         return HeaderValue.Empty;
     }
 }
@@ -585,6 +566,40 @@ public class content_type_tests
                 Assert.IsNull(parsed, $"Expected null for {test.header}");
             }
         }
+    }
+
+    // Regression tests for Phase 2 fixes -- each pins a Rust-verified expected value.
+
+    [TestMethod]
+    public void eof_with_no_trailing_newline_returns_empty_matches_rust()
+    {
+        // Rust: parsing the literal bytes "text/plain" with NO trailing newline at all
+        // returns HeaderValue::Empty -- everything parsed so far is discarded, not
+        // salvaged into a real ContentType (PARITY-AUDIT.md FILE 15).
+        var stream = new MessageStream(System.Text.Encoding.UTF8.GetBytes("text/plain"));
+        var result = stream.parse_content_type();
+        Assert.IsNull(result.as_content_type());
+    }
+
+    [TestMethod]
+    public void type_lowering_is_ascii_only_matches_rust()
+    {
+        // Rust: make_ascii_lowercase() only folds ASCII A-Z; a non-ASCII
+        // "uppercase-like" character is left untouched (PARITY-AUDIT.md FILE 20).
+        // Attribute name is ASCII 'A' + Kelvin sign (Unicode code point 212A hex,
+        // used directly as a Unicode character in this source file). The ASCII 'A' is what triggers the
+        // is_lower_case=false path in the first place (the parser's uppercase
+        // detection only matches literal ASCII A-Z bytes, so a lone non-ASCII char by
+        // itself would not trigger lowering at all). The Kelvin sign is
+        // Unicode-equivalent to plain 'k' under full case folding, so
+        // ToLowerInvariant() would incorrectly fold it; ASCII-only folding must not.
+        string attrName = "A" + "K";
+        string expectedName = "a" + "K";
+        var stream = new MessageStream(System.Text.Encoding.UTF8.GetBytes("text/plain; " + attrName + "=\"v\"\n"));
+        var result = stream.parse_content_type().as_content_type();
+        Assert.IsNotNull(result);
+        Assert.IsNotNull(result!.attributes);
+        Assert.AreEqual(expectedName, result.attributes![0].name);
     }
 }
 #endif

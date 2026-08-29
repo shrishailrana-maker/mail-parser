@@ -182,7 +182,9 @@ public partial class MessageStream
         {
             return false;
         }
-        if (n1.HasValue && char.IsWhiteSpace((char)n1.Value))
+        // Rust: a.is_ascii_whitespace() (PARITY-AUDIT.md FILE 16: was Unicode
+        // char.IsWhiteSpace, same recurring pattern fixed elsewhere via this helper).
+        if (n1.HasValue && HeaderExtensions.IsAsciiWhitespace(n1.Value))
         {
             skip_crlf();
             return false;

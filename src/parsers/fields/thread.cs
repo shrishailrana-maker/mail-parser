@@ -31,7 +31,7 @@ public static class ThreadUtils
     private static readonly HashSet<string> FwdPrefixes = new(StringComparer.OrdinalIgnoreCase)
     {
         "fwd", "fw", "rv", "enc", "vs", "doorst", "vl", "tr", "wg", "πρθ",
-        "הועבער", "továbbítás", "i", "fs", "trs", "vb",
+        "הועבר", "továbbítás", "i", "fs", "trs", "vb",
         "pd", "i̇lt", "yml", "إعادة توجيه", "回覆", "轉寄"
     };
 
@@ -323,6 +323,26 @@ public class thread_tests
         {
             Assert.AreEqual(expected, ThreadUtils.trim_trailing_fwd(input), $"Failed for {input}");
         }
+    }
+
+    [TestMethod]
+    public void hebrew_forward_prefix_matches_rust()
+    {
+        // PARITY-AUDIT.md FILE 18: the Hebrew forward-prefix string had an extra
+        // character relative to Rust (confirmed by byte-level hex comparison during the
+        // Phase 2 fix, not just visual inspection -- Hebrew RTL text is not reliable to
+        // verify by eye). Built here from explicit UTF-8 byte literals (not typed
+        // glyphs) to keep this test unambiguous: 0xD7 0x94/0x95/0xA2/0x91/0xA8 is
+        // Hebrew He-Vav-Ayin-Bet-Resh, 5 characters, matching the exact bytes in
+        // Rust's thread.rs source.
+        string hebrewForwarded = System.Text.Encoding.UTF8.GetString(
+            new byte[] { 0xD7, 0x94, 0xD7, 0x95, 0xD7, 0xA2, 0xD7, 0x91, 0xD7, 0xA8 });
+        Assert.AreEqual(5, hebrewForwarded.Length);
+        // If the prefix is NOT recognized, thread_name() breaks out at the colon with
+        // thread_name_start still at 0, returning the untrimmed original string -- so
+        // getting back just "hello" (not the whole "<hebrew>: hello") confirms the
+        // prefix WAS matched and stripped, which is what this test actually verifies.
+        Assert.AreEqual("hello", ThreadUtils.thread_name(hebrewForwarded + ": hello"));
     }
 }
 #endif

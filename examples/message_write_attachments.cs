@@ -55,11 +55,10 @@ R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7
         {
             if (!attachment.is_message())
             {
-                var bytes = attachment.binary() ?? attachment.inline_binary();
-                if (bytes != null)
-                {
-                    File.WriteAllBytes(attachment.attachment_name() ?? "Untitled", bytes);
-                }
+                // Rust: attachment.contents() -- uniform across all non-message PartType
+                // variants. binary() ?? inline_binary() used to silently skip a Text/Html
+                // "attachment" (PARITY-AUDIT.md examples/message_write_attachments.cs finding).
+                File.WriteAllBytes(attachment.attachment_name() ?? "Untitled", attachment.contents());
             }
             else
             {

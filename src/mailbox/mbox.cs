@@ -80,7 +80,11 @@ public class MboxMessage
                 dt.year = y;
             }
 
-            if (dt.year > 0 && dt.month > 0 && dt.day > 0)
+            // Rust: if dt.is_valid() { dt.to_timestamp() as u64 } else { 0 } -- the full
+            // 8-field range check, not just "year/month/day are nonzero" (which let a
+            // malformed time silently fabricate a bogus timestamp instead of safely
+            // reporting "unknown" -- PARITY-AUDIT.md FILE 14).
+            if (dt.is_valid())
             {
                 internal_date = (ulong)dt.to_timestamp();
             }
@@ -109,6 +113,12 @@ public class MboxMessageIterator : IEnumerable<MboxMessage>, IEnumerator<MboxMes
         _stream = stream;
     }
 
+    // No Rust equivalent -- MessageIterator<T> is generic over std::io::BufRead only, a
+    // pure byte stream. This convenience overload decodes via the TextReader's own
+    // encoding before re-encoding to UTF-8, which is lossy for any content that isn't
+    // valid text in that encoding (mbox message bodies are not guaranteed to be UTF-8).
+    // Prefer the Stream or byte[] constructor when byte-exact fidelity matters
+    // (PARITY-AUDIT.md FILE 14 -- examples/mailbox_parse_mbox.cs no longer uses this path).
     public MboxMessageIterator(TextReader reader)
     {
         _stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(reader.ReadToEnd()));
@@ -122,6 +132,9 @@ public class MboxMessageIterator : IEnumerable<MboxMessage>, IEnumerator<MboxMes
     public MboxMessage Current => _current!;
     object IEnumerator.Current => _current!;
 
+    private static readonly byte[] CRLF = new byte[] { (byte)'\r', (byte)'\n' };
+    private static readonly byte[] LF = new byte[] { (byte)'\n' };
+
     public bool MoveNext()
     {
         if (_isEof && _pendingMessage == null)
@@ -132,7 +145,7 @@ public class MboxMessageIterator : IEnumerable<MboxMessage>, IEnumerator<MboxMes
 
         while (true)
         {
-            var line = ReadLineBytes();
+            var line = ReadLineBytes(out byte[] terminator);
             if (line == null)
             {
                 _isEof = true;
@@ -179,14 +192,25 @@ public class MboxMessageIterator : IEnumerable<MboxMessage>, IEnumerator<MboxMes
                             line = line.AsSpan(1).ToArray();
                         }
                     }
+                    // Rust: read_until keeps the delimiter (and any preceding '\r')
+                    // verbatim in the returned bytes -- re-append whatever terminator
+                    // this line actually had (CRLF, LF, or none for a final
+                    // unterminated line), not an unconditional bare '\n'
+                    // (PARITY-AUDIT.md FILE 14: the prior code always normalized to
+                    // bare '\n', permanently discarding any '\r' that was present).
                     _messageBuffer.AddRange(line);
-                    _messageBuffer.Add((byte)'\n');
+                    _messageBuffer.AddRange(terminator);
                 }
             }
         }
     }
 
-    private byte[]? ReadLineBytes()
+    // Returns the line content with its terminator stripped (unchanged from before --
+    // the From-line detection and address/date parsing below depend on this shape and
+    // are not part of the CRLF-preservation fix), plus the exact terminator bytes that
+    // were actually present, via `terminator`, so the caller can reconstruct the
+    // original bytes verbatim instead of normalizing every line ending to '\n'.
+    private byte[]? ReadLineBytes(out byte[] terminator)
     {
         _currentLine.Clear();
         int b;
@@ -197,11 +221,19 @@ public class MboxMessageIterator : IEnumerable<MboxMessage>, IEnumerator<MboxMes
                 if (_currentLine.Count > 0 && _currentLine[_currentLine.Count - 1] == '\r')
                 {
                     _currentLine.RemoveAt(_currentLine.Count - 1);
+                    terminator = CRLF;
+                }
+                else
+                {
+                    terminator = LF;
                 }
                 return _currentLine.ToArray();
             }
             _currentLine.Add((byte)b);
         }
+        // EOF reached with no trailing newline at all (a final, unterminated line) --
+        // Rust's read_until would not have appended a delimiter either in this case.
+        terminator = Array.Empty<byte>();
         return _currentLine.Count > 0 ? _currentLine.ToArray() : null;
     }
 
@@ -257,6 +289,35 @@ public class mbox_tests
         Assert.AreEqual((ulong)1516030200, msgs[3].internal_date);
         Assert.AreEqual("other@domain.com", msgs[3].from);
         Assert.AreEqual("Message 4\n> From\n>F\n", System.Text.Encoding.UTF8.GetString(msgs[3].contents));
+    }
+
+    // Regression tests for Phase 2 fixes -- each pins a Rust-verified expected value.
+
+    [TestMethod]
+    public void crlf_line_endings_preserved_verbatim_matches_rust()
+    {
+        // Rust: read_until keeps the delimiter (and any preceding '\r') verbatim --
+        // a CRLF-terminated mbox file must keep its '\r' bytes in the stored message
+        // contents, not have every line ending silently normalized to bare '\n'
+        // (PARITY-AUDIT.md FILE 14).
+        byte[] message = System.Text.Encoding.UTF8.GetBytes(
+            "From a@b Sat Jan 3 01:05:34 1996\r\nHello\r\n\r\n");
+        var it = new MboxMessageIterator(message);
+        Assert.IsTrue(it.MoveNext());
+        Assert.AreEqual("Hello\r\n\r\n", System.Text.Encoding.UTF8.GetString(it.Current.contents));
+    }
+
+    [TestMethod]
+    public void malformed_time_reports_unknown_date_matches_rust()
+    {
+        // Rust: if dt.is_valid() { ... } else { 0 } -- a From-line with an out-of-range
+        // hour must report internal_date = 0 (unknown), not fabricate a timestamp from
+        // partially-parsed fields (PARITY-AUDIT.md FILE 14).
+        byte[] message = System.Text.Encoding.UTF8.GetBytes(
+            "From a@b Sat Jan 3 99:05:34 1996\nHello\n\n");
+        var it = new MboxMessageIterator(message);
+        Assert.IsTrue(it.MoveNext());
+        Assert.AreEqual(0UL, it.Current.internal_date);
     }
 }
 #endif

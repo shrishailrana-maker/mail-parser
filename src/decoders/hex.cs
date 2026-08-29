@@ -90,11 +90,11 @@ public static class HexUtils
         }
 
     done:
-        if (state != HexState.None)
-        {
-            success = false;
-        }
-
+        // Rust has no post-loop check here: a truncated trailing %XX escape at end of
+        // input leaves `success` at whatever it already was (true, unless an explicit
+        // failure fired mid-loop) -- the extra check that used to be here (flipping
+        // success to false based on leftover `state`) had no Rust counterpart and was a
+        // confirmed bug (PARITY-AUDIT.md FILE 9): "this%2" must decode as (true, "this").
         return (success, result.ToArray());
     }
 }
@@ -119,6 +119,16 @@ public class hex_tests
             var resultStr = System.Text.Encoding.UTF8.GetString(result);
             Assert.AreEqual(expected, resultStr, $"Failed for '{input}'");
         }
+    }
+
+    [TestMethod]
+    public void decode_hex_truncated_escape_matches_rust()
+    {
+        // Rust: decode_hex(b"this%2") == (true, b"this") -- a truncated trailing escape
+        // is a recoverable partial success, not a hard failure (PARITY-AUDIT.md FILE 9).
+        var (success, result) = HexUtils.decode_hex(System.Text.Encoding.UTF8.GetBytes("this%2"));
+        Assert.IsTrue(success);
+        Assert.AreEqual("this", System.Text.Encoding.UTF8.GetString(result));
     }
 }
 #endif

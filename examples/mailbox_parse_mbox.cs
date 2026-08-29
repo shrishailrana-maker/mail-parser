@@ -22,8 +22,13 @@ public static class MailboxParseMboxExample
 {
     public static void Main()
     {
-        using var reader = new StreamReader(Console.OpenStandardInput());
-        var it = new MboxMessageIterator(reader);
+        // Rust: std::io::stdin().lock() is read as raw bytes (BufRead), never decoded as
+        // text. Routing through a StreamReader/TextReader here would decode-then-reencode
+        // the input, silently corrupting any non-UTF8 or malformed bytes before the mbox
+        // parser -- which is meant to operate on the raw bytes -- ever saw them
+        // (PARITY-AUDIT.md FILE 14 / examples/mailbox_parse_mbox.cs finding).
+        using var stdin = Console.OpenStandardInput();
+        var it = new MboxMessageIterator(stdin);
         var parser = new MessageParser();
 
         foreach (var rawMessage in it)

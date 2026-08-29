@@ -169,15 +169,24 @@ public class MaildirFolderIterator : IEnumerable<MaildirFolder>
             string dirName = Path.GetFileName(dir);
             if (dirName is "cur" or "new" or "tmp") continue;
 
-            if (Directory.Exists(Path.Combine(dir, "cur")) || Directory.Exists(Path.Combine(dir, "new")))
+            // Rust: MessageIterator::new_ requires BOTH 'cur' and 'new' to exist (each
+            // missing one independently returns Err(NotFound)) -- this used to accept
+            // either one alone, a confirmed bug (PARITY-AUDIT.md FILE 13).
+            if (Directory.Exists(Path.Combine(dir, "cur")) && Directory.Exists(Path.Combine(dir, "new")))
             {
                 string rel = Path.GetRelativePath(_rootPath, dir);
                 if (_prefix != null && rel.StartsWith(_prefix))
                 {
                     rel = rel.Substring(_prefix.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                 }
-                string folderName = rel.Replace(Path.DirectorySeparatorChar, '.').Replace(Path.AltDirectorySeparatorChar, '.');
-                if (folderName.StartsWith(".")) folderName = folderName.Substring(1);
+                // Rust: self.name_stack.join(self.prefix.unwrap_or("/")) -- the join
+                // separator is the configured prefix, or "/" when none was given (the
+                // documented LAYOUT=fs / Dovecot mode). This used to always use "."
+                // regardless of prefix, a confirmed bug (PARITY-AUDIT.md FILE 13).
+                string sep = _prefix ?? "/";
+                string folderName = rel.Replace(Path.DirectorySeparatorChar.ToString(), sep)
+                                        .Replace(Path.AltDirectorySeparatorChar.ToString(), sep);
+                if (_prefix != null && folderName.StartsWith(sep)) folderName = folderName.Substring(sep.Length);
                 yield return new MaildirFolder(dir, folderName);
             }
         }
@@ -293,6 +302,61 @@ public class maildir_tests
         {
             Assert.AreEqual(expected_messages[i].folder, messages[i].folder, $"Folder mismatch at {i}");
             Assert.AreEqual(expected_messages[i].msg, messages[i].msg, $"Message mismatch at {i}");
+        }
+    }
+
+    // Regression tests for Phase 2 fixes -- each pins a Rust-verified expected value.
+
+    [TestMethod]
+    public void cur_and_new_both_required_matches_rust()
+    {
+        // Rust: MessageIterator::new_ requires BOTH 'cur' and 'new' to exist. A folder
+        // with only 'cur' (no 'new') must be silently skipped, not accepted
+        // (PARITY-AUDIT.md FILE 13).
+        string root = Path.Combine(Path.GetTempPath(), "maildir_test_" + Guid.NewGuid());
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "cur"));
+            Directory.CreateDirectory(Path.Combine(root, "new"));
+            Directory.CreateDirectory(Path.Combine(root, ".HalfFolder", "cur")); // no 'new'
+            Directory.CreateDirectory(Path.Combine(root, ".FullFolder", "cur"));
+            Directory.CreateDirectory(Path.Combine(root, ".FullFolder", "new"));
+
+            var it = new MaildirFolderIterator(root, ".");
+            var names = new List<string?>();
+            foreach (var folder in it) names.Add(folder.name);
+
+            Assert.IsTrue(names.Contains("FullFolder"));
+            Assert.IsFalse(names.Contains("HalfFolder"));
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public void separator_uses_prefix_or_slash_matches_rust()
+    {
+        // Rust: self.name_stack.join(self.prefix.unwrap_or("/")) -- with no prefix
+        // (the documented LAYOUT=fs mode), nested folder names join with '/', not '.'
+        // (PARITY-AUDIT.md FILE 13).
+        string root = Path.Combine(Path.GetTempPath(), "maildir_test_" + Guid.NewGuid());
+        try
+        {
+            string nested = Path.Combine(root, "Work", "Projects");
+            Directory.CreateDirectory(Path.Combine(nested, "cur"));
+            Directory.CreateDirectory(Path.Combine(nested, "new"));
+
+            var it = new MaildirFolderIterator(root, null);
+            var names = new List<string?>();
+            foreach (var folder in it) names.Add(folder.name);
+
+            Assert.IsTrue(names.Contains("Work/Projects"), $"Expected 'Work/Projects', got: {string.Join(", ", names)}");
+        }
+        finally
+        {
+            Directory.Delete(root, true);
         }
     }
 }

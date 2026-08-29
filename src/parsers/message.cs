@@ -276,7 +276,13 @@ public partial class MessageParser
             if (mtype != MimeType.Message)
             {
                 bool is_disp_att = part_headers.header_value(HeaderName.ContentDisposition)?.as_content_type()?.is_attachment() ?? false;
-                bool is_inline_part = is_inline && !is_disp_att && (state.parts == 1 || state.mime_type != MimeType.MultipartRelated && (mtype == MimeType.Inline || (content_type != null && !content_type.has_attribute("name"))));
+                // Rust: content_type.is_none_or(|c| !c.has_attribute("name")) -- true
+                // when content_type is None (missing Content-Type header, the RFC 2045
+                // default), not just when it's present-but-nameless. The prior
+                // `content_type != null && ...` required a Content-Type header to be
+                // present at all, so a part with no Content-Type header (a common case,
+                // not an edge case) was never classified inline (PARITY-AUDIT.md FILE 20).
+                bool is_inline_part = is_inline && !is_disp_att && (state.parts == 1 || state.mime_type != MimeType.MultipartRelated && (mtype == MimeType.Inline || (content_type == null || !content_type.has_attribute("name"))));
 
                 is_inline_part = is_inline_part || (state.parts == 1 && state.mime_type == MimeType.Message && mtype == MimeType.TextPlain && is_encoding_problem);
 
@@ -680,6 +686,30 @@ public class message_tests
         Assert.AreEqual(107, totalInputs, "Total inputs count mismatch");
         Assert.AreEqual(214, totalJsonComparisons, "Total JSON comparisons count mismatch");
         Assert.AreEqual(107, totalRoundTrips, "Total round trips count mismatch");
+    }
+
+    [TestMethod]
+    public void part_with_no_content_type_is_inline_matches_rust()
+    {
+        // Rust: content_type.is_none_or(|c| !c.has_attribute("name")) is true when
+        // content_type is None -- a non-first MIME part with NO Content-Type header at
+        // all (the RFC 2045 default, routed through mime_type()'s None branch) must
+        // still be classified inline under a non-multipart/related parent, not silently
+        // demoted to a plain attachment (PARITY-AUDIT.md FILE 20).
+        byte[] raw = System.Text.Encoding.UTF8.GetBytes(
+            "Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n" +
+            "--b\r\nContent-Type: text/plain\r\n\r\nfirst part\r\n" +
+            "--b\r\n\r\nsecond part, no Content-Type header\r\n" +
+            "--b--\r\n");
+        var msg = new MessageParser().parse(raw);
+        Assert.IsNotNull(msg);
+        // The second part (no Content-Type) must be picked up as a text body candidate,
+        // not pushed into attachments -- that's the actual fix. (Both parts land in
+        // text_body_count() here since neither is under a multipart/alternative parent,
+        // so there's no exclusivity between the html/text candidate lists -- that part
+        // is unrelated to this fix and is not what's being asserted.)
+        Assert.AreEqual(2, msg!.text_body_count());
+        Assert.AreEqual(0, msg.attachment_count());
     }
 }
 #endif

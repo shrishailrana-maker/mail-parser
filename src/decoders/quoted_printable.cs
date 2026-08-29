@@ -25,8 +25,13 @@ public static class QuotedPrintableUtils
 {
     public static readonly sbyte[] HEX_MAP = new sbyte[256] { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, -1, -1, -1, -1, -1, -1, -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 
-    // Rust: quoted_printable_decode
-    public static byte[] quoted_printable_decode(ReadOnlySpan<byte> bytes)
+    // Rust: quoted_printable_decode -- fixed (PARITY-AUDIT.md FILE 10): this is a strict,
+    // all-or-nothing decode in Rust (returns Option<Vec<u8>>, None on any malformed
+    // escape). The prior C# version couldn't signal failure at all (returned byte[], not
+    // byte[]?) and fabricated recovery bytes in 3 places instead of aborting -- apparently
+    // conflated with decode_quoted_printable_mime below, which IS legitimately lenient.
+    // Also fixed: ASCII-only whitespace (was Unicode char.IsWhiteSpace).
+    public static byte[]? quoted_printable_decode(ReadOnlySpan<byte> bytes)
     {
         var buf = new List<byte>(bytes.Length);
         int state = 0; // 0 = None, 1 = Eq, 2 = Hex1
@@ -45,8 +50,7 @@ public static class QuotedPrintableUtils
                     }
                     else
                     {
-                        buf.Add((byte)'=');
-                        state = 1;
+                        return null;
                     }
                     break;
                 case (byte)'\n':
@@ -71,7 +75,7 @@ public static class QuotedPrintableUtils
                     switch (state)
                     {
                         case 0:
-                            if (char.IsWhiteSpace((char)ch))
+                            if (HeaderExtensions.IsAsciiWhitespace(ch))
                             {
                                 ws_count++;
                             }
@@ -87,12 +91,9 @@ public static class QuotedPrintableUtils
                             {
                                 state = 2;
                             }
-                            else if (!char.IsWhiteSpace((char)ch))
+                            else if (!HeaderExtensions.IsAsciiWhitespace(ch))
                             {
-                                state = 0;
-                                buf.Add((byte)'=');
-                                buf.Add(ch);
-                                ws_count = 0;
+                                return null;
                             }
                             break;
                         case 2:
@@ -105,9 +106,7 @@ public static class QuotedPrintableUtils
                             }
                             else
                             {
-                                buf.Add((byte)'=');
-                                buf.Add(ch);
-                                ws_count = 0;
+                                return null;
                             }
                             break;
                     }
@@ -196,7 +195,7 @@ public partial class MessageStream
                     switch (state)
                     {
                         case QuotedPrintableState.None:
-                            if (char.IsWhiteSpace((char)ch))
+                            if (HeaderExtensions.IsAsciiWhitespace(ch))
                             {
                                 ws_count++;
                             }
@@ -212,7 +211,7 @@ public partial class MessageStream
                             {
                                 state = QuotedPrintableState.Hex1;
                             }
-                            else if (!char.IsWhiteSpace((char)ch))
+                            else if (!HeaderExtensions.IsAsciiWhitespace(ch))
                             {
                                 state = QuotedPrintableState.None;
                                 buf.Add((byte)'=');
@@ -400,6 +399,17 @@ public class quoted_printable_tests
             var res = QuotedPrintableUtils.quoted_printable_decode(System.Text.Encoding.UTF8.GetBytes(encoded_str)) ?? Array.Empty<byte>();
             Assert.AreEqual(expected_result, System.Text.Encoding.UTF8.GetString(res), $"Failed for {encoded_str}");
         }
+    }
+
+    [TestMethod]
+    public void quoted_printable_decode_fails_strictly_matches_rust()
+    {
+        // Rust: quoted_printable_decode returns None (a hard failure) on a malformed
+        // escape -- it never fabricates recovery bytes and continues. Three previously
+        // separate bugs, all fixed together (PARITY-AUDIT.md FILE 10).
+        Assert.IsNull(QuotedPrintableUtils.quoted_printable_decode(System.Text.Encoding.UTF8.GetBytes("==41")), "double '=' must fail");
+        Assert.IsNull(QuotedPrintableUtils.quoted_printable_decode(System.Text.Encoding.UTF8.GetBytes("=z")), "non-hex, non-whitespace after '=' must fail");
+        Assert.IsNull(QuotedPrintableUtils.quoted_printable_decode(System.Text.Encoding.UTF8.GetBytes("=4z")), "invalid second hex digit must fail");
     }
 
     [TestMethod]

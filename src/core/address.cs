@@ -60,7 +60,9 @@ public abstract partial record Address
     };
 
     // Rust: Address::contains
-    public bool contains(string addr) => iter().Any(a => string.Equals(a.address, addr, StringComparison.OrdinalIgnoreCase));
+    // Rust: a.eq_ignore_ascii_case(addr) -- ASCII-only, not Unicode OrdinalIgnoreCase
+    // (PARITY-AUDIT.md FILE 3, minor).
+    public bool contains(string addr) => iter().Any(a => HeaderExtensions.EqIgnoreAsciiCase(a.address, addr));
 
     // Rust: Address::into_owned
     public Address into_owned() => this switch

@@ -13,6 +13,10 @@
 
 using System;
 
+#if STALWART_PORT_TESTS
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+#endif
+
 namespace Stalwart.MailParser.Port;
 
 // Rust: MessageStream
@@ -121,20 +125,24 @@ public partial class MessageStream
         return false;
     }
 
-    // Rust: MessageStream::bytes
+    // Rust: MessageStream::bytes -- `self.data.get(range).unwrap_or_default()`; see
+    // bytes_span() below for the full explanation (same fix, same reasoning: reject an
+    // out-of-bounds range entirely rather than clamping it -- PARITY-AUDIT.md FILE 19).
     public ReadOnlyMemory<byte> bytes(int start, int end)
     {
-        if (start < 0) start = 0;
-        if (end > _data.Length) end = _data.Length;
-        if (start >= end) return ReadOnlyMemory<byte>.Empty;
+        if (start < 0 || end > _data.Length || start > end) return ReadOnlyMemory<byte>.Empty;
         return _data.Slice(start, end - start);
     }
 
+    // Rust: MessageStream::bytes -- `self.data.get(range).unwrap_or_default()`. A range
+    // is rejected (empty result) if EITHER start > end OR end > data.len() -- there is no
+    // clamping. The prior version here clamped an out-of-bounds `end` down to the buffer
+    // length instead of rejecting the whole request, which was a confirmed bug
+    // (PARITY-AUDIT.md FILE 19): Rust returns empty for an invalid range; this returned a
+    // truncated-but-nonempty slice instead.
     public ReadOnlySpan<byte> bytes_span(int start, int end)
     {
-        if (start < 0) start = 0;
-        if (end > _data.Length) end = _data.Length;
-        if (start >= end) return ReadOnlySpan<byte>.Empty;
+        if (start < 0 || end > _data.Length || start > end) return ReadOnlySpan<byte>.Empty;
         return _data.Span.Slice(start, end - start);
     }
 
@@ -192,3 +200,22 @@ public partial class MessageStream
         return null;
     }
 }
+
+#if STALWART_PORT_TESTS
+[TestClass]
+public class parsers_mod_tests
+{
+    [TestMethod]
+    public void bytes_span_rejects_out_of_bounds_end_matches_rust()
+    {
+        // Rust: self.data.get(range).unwrap_or_default() -- an out-of-bounds `end`
+        // rejects the WHOLE range (empty result), it does not clamp to a partial,
+        // nonempty slice (PARITY-AUDIT.md FILE 19).
+        var stream = new MessageStream(System.Text.Encoding.UTF8.GetBytes("0123456789"));
+        Assert.AreEqual(0, stream.bytes_span(5, 1000).Length);
+        Assert.AreEqual(0, stream.bytes(5, 1000).Length);
+        // A valid range still works normally.
+        Assert.AreEqual("56789", System.Text.Encoding.UTF8.GetString(stream.bytes_span(5, 10)));
+    }
+}
+#endif

@@ -19,6 +19,10 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
+#if STALWART_PORT_TESTS
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+#endif
+
 namespace Stalwart.MailParser.Port;
 
 public sealed class SerdeJsonEncoder : JavaScriptEncoder
@@ -274,7 +278,7 @@ public record Attribute
 }
 
 // Rust: ContentType
-public record ContentType
+public partial record ContentType
 {
     [JsonPropertyName("c_type")]
     public string c_type { get; set; } = "";
@@ -296,22 +300,12 @@ public record ContentType
 
     public string mimetype() => c_type;
     public string? subtype() => c_subtype;
-    public string? attribute(string attrName)
-    {
-        if (attributes == null) return null;
-        foreach (var attr in attributes)
-        {
-            if (string.Equals(attr.name, attrName, StringComparison.OrdinalIgnoreCase))
-                return attr.value;
-        }
-        return null;
-    }
+    // attribute(), is_attachment(): see core/header.cs (Rust: impl ContentType in header.rs).
     public bool has_attribute(string attrName) => attribute(attrName) != null;
-    public bool is_attachment() => string.Equals(c_type, "attachment", StringComparison.OrdinalIgnoreCase);
 }
 
 // Rust: DateTime
-public struct DateTime : IEquatable<DateTime>, IComparable<DateTime>
+public partial struct DateTime : IEquatable<DateTime>, IComparable<DateTime>
 {
     [JsonPropertyName("year")]
     public ushort year { get; set; }
@@ -387,7 +381,7 @@ public struct DateTime : IEquatable<DateTime>, IComparable<DateTime>
 
 // Rust: Host
 [JsonConverter(typeof(HostJsonConverter))]
-public abstract record Host
+public abstract partial record Host
 {
     public sealed record NameRecord(string Value) : Host;
     public sealed record IpAddrRecord(IPAddress Value) : Host;
@@ -447,7 +441,7 @@ public enum Protocol
 }
 
 // Rust: Received
-public record Received
+public partial record Received
 {
     [JsonPropertyName("from")]
     public Host? from { get; set; }
@@ -495,7 +489,7 @@ public record Received
 
 // Rust: HeaderValue
 [JsonConverter(typeof(HeaderValueJsonConverter))]
-public abstract record HeaderValue
+public abstract partial record HeaderValue
 {
     public sealed record AddressRecord(Address Value) : HeaderValue;
     public sealed record TextRecord(string Value) : HeaderValue;
@@ -513,8 +507,7 @@ public abstract record HeaderValue
     public static HeaderValue Received(Received received) => new ReceivedRecord(received);
     public static readonly HeaderValue Empty = new EmptyRecord();
 
-    public string? as_text() => this is TextRecord tr ? tr.Value : null;
-    public List<string>? as_text_list() => this is TextListRecord tlr ? tlr.Value : null;
+    // as_text(), as_text_list(): see core/header.cs (Rust: impl HeaderValue in header.rs).
     public Address? as_address() => this is AddressRecord ar ? ar.Value : null;
     public Addr? as_addr() => this is AddressRecord ar ? ar.Value.as_addr() : null;
     public List<Addr>? as_list() => this is AddressRecord ar ? ar.Value.as_list() : null;
@@ -964,7 +957,7 @@ public class HeaderNameJsonConverter : JsonConverter<HeaderName>
 }
 
 [JsonConverter(typeof(HeaderNameJsonConverter))]
-public struct HeaderName : IEquatable<HeaderName>
+public partial struct HeaderName : IEquatable<HeaderName>
 {
     public KnownHeader Kind { get; }
     public string? CustomName { get; }
@@ -1132,15 +1125,23 @@ public struct HeaderName : IEquatable<HeaderName>
     public static readonly HeaderName WrongRecipient = new(KnownHeader.WrongRecipient);
 
     public static HeaderName Other(string name) => new(name);
+    // Rust: HeaderName::parse -- returns None (not Other("")) when data is empty or
+    // contains any character outside [A-Za-z0-9_-], so callers (e.g. the stream tokenizer
+    // in parsers/header.cs: `HeaderName.parse(rawStr) ?? HeaderName.Other(rawStr)`) can
+    // apply their OWN fallback using the original text. Must call the private strict
+    // validator directly, NOT the public ParseHeaderName (which bakes in From<&str>'s
+    // OWN unwrap_or(Other("")) fallback and would mask this null with an empty-named
+    // Other instead) -- conflating the two broke the 107-EML corpus, caught and fixed
+    // immediately (PARITY-AUDIT.md).
     public static HeaderName? parse(string? data)
     {
         if (string.IsNullOrEmpty(data)) return null;
-        return HeaderNameUtils.ParseHeaderName(data);
+        return HeaderNameUtils.ParseHeaderNameStrict(data);
     }
     public static HeaderName? parse(ReadOnlySpan<byte> data)
     {
         if (data.IsEmpty) return null;
-        return HeaderNameUtils.ParseHeaderName(System.Text.Encoding.ASCII.GetString(data));
+        return HeaderNameUtils.ParseHeaderNameStrict(System.Text.Encoding.ASCII.GetString(data));
     }
 
     public static implicit operator HeaderName(string name) => HeaderNameUtils.ParseHeaderName(name);
@@ -1316,10 +1317,43 @@ public static class HeaderNameUtils
         };
     }
 
+    // Rust: HeaderName::parse (parsers/header.rs) -- returns Option<HeaderName>, used
+    // directly by HeaderName.parse(string?)/HeaderName.parse(ReadOnlySpan<byte>) below
+    // (which need the real null-on-failure signal so THEIR OWN callers, e.g. the stream
+    // tokenizer in parsers/header.cs, can apply their OWN fallback), and separately by
+    // ParseHeaderName further below (matching `impl From<&str> for HeaderName`, which
+    // wraps this with `.unwrap_or(HeaderName::Other("".into()))` at the From call site,
+    // not inside parse() itself -- conflating these two was an earlier mistake in this
+    // same fix, caught immediately by the 107-EML corpus regression it caused).
+    // Rust validates STRICTLY: any character outside [A-Za-z0-9_-] makes parse() return
+    // None entirely (not just skip the bad character) -- this was missing here; any string
+    // reached HeaderName.Other(name) with the original text intact, even one containing
+    // e.g. embedded whitespace or punctuation, never rejected (PARITY-AUDIT.md: found
+    // while verifying lib.cs was not fully "just JSON infra" as previously assumed). Note
+    // this does NOT apply to the HeaderName(string) constructor / HeaderName.Other(name)
+    // factory used elsewhere for direct unvalidated construction -- only this validation
+    // function and its two callers, matching Rust's parse()/From<&str> specifically.
+    internal static HeaderName? ParseHeaderNameStrict(string name)
+    {
+        if (name.Length == 0) return null;
+
+        var lc = new char[name.Length];
+        for (int i = 0; i < name.Length; i++)
+        {
+            char ch = name[i];
+            if (ch >= 'A' && ch <= 'Z') lc[i] = (char)(ch - 'A' + 'a');
+            else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') lc[i] = ch;
+            else return null; // Rust: parse() returns None on the first invalid char
+        }
+
+        var known = ParseKnown(new string(lc));
+        return known.HasValue ? new HeaderName(known.Value) : HeaderName.Other(name); // Rust: HeaderName::Other(data) uses the ORIGINAL (not lowercased) text
+    }
+
+    // Rust: `impl From<&str> for HeaderName` -- parse(value).unwrap_or(Other("".into()))
     public static HeaderName ParseHeaderName(string name)
     {
-        var known = ParseKnown(name);
-        return known.HasValue ? new HeaderName(known.Value) : HeaderName.Other(name);
+        return ParseHeaderNameStrict(name) ?? HeaderName.Other("");
     }
 
     public static string HeaderNameAsStr(HeaderName hn)
@@ -1675,7 +1709,25 @@ public partial record MessagePart
 
     [JsonPropertyName("is_encoding_problem")]
     public bool is_encoding_problem { get; set; }
-    public int len() => body.len();
+    // Rust: MessagePart::len() (header.rs) is a DIFFERENT function from PartType::len()
+    // (body.rs) despite the shared name and near-identical match arms -- they diverge on
+    // the Message variant specifically: MessagePart::len() calls message.raw_message()
+    // (the public, offset-sliced accessor), while PartType::len() reads
+    // message.raw_message (the private field, unsliced) directly. The previous
+    // `body.len()` delegation silently used the PartType.len() (unsliced) semantics here
+    // too, which is wrong for MessagePart::len() specifically whenever the backing buffer
+    // holds bytes outside the root part's range -- the same root cause as the
+    // Message::raw_message() bug (PARITY-AUDIT.md FILE 2), now that raw_message_bytes()
+    // is fixed to be correctly sliced.
+    public int len() => body switch
+    {
+        PartType.TextRecord t => System.Text.Encoding.UTF8.GetByteCount(t.Value),
+        PartType.HtmlRecord h => System.Text.Encoding.UTF8.GetByteCount(h.Value),
+        PartType.BinaryRecord b => b.Value.Length,
+        PartType.InlineBinaryRecord ib => ib.Value.Length,
+        PartType.MessageRecord m => m.Value.raw_message_bytes().Length,
+        _ => 0
+    };
 
     [JsonPropertyName("body")]
     public PartType body { get; set; } = PartType.Multipart(new List<uint>());
@@ -1732,3 +1784,54 @@ public interface IMimeHeaders
     string? attachment_name();
     bool is_content_type(string type_, string subtype);
 }
+
+#if STALWART_PORT_TESTS
+[TestClass]
+public class lib_header_name_tests
+{
+    [TestMethod]
+    public void implicit_conversion_rejects_invalid_chars_matches_rust()
+    {
+        // Rust: impl From<&str> for HeaderName -- HeaderName::parse(value) returns None
+        // for any character outside [A-Za-z0-9_-], and From<&str> then falls back to
+        // Other("") (the WHOLE original text discarded, not preserved) -- confirmed by
+        // reading parsers/header.rs's HeaderName::parse directly (PARITY-AUDIT.md: found
+        // while verifying lib.cs was not fully "just JSON infra" as previously assumed).
+        // This is distinct from the stream tokenizer's own fallback in parsers/header.cs
+        // (`HeaderName.parse(rawStr) ?? HeaderName.Other(rawStr)`), which correctly
+        // preserves the original text -- that path was already correct and must stay so
+        // (covered by header_tests.header_name_parse's "mal formed" case).
+        HeaderName hn = "mal formed"; // implicit operator -- contains a space
+        Assert.AreEqual(KnownHeader.Other, hn.Kind);
+        Assert.AreEqual("", hn.CustomName);
+    }
+
+    [TestMethod]
+    public void implicit_conversion_accepts_valid_unknown_name_matches_rust()
+    {
+        // Sanity: a valid-but-unknown name (letters, digits, hyphen, underscore only)
+        // must still become Other(originalText), unaffected by the strict-validation fix.
+        HeaderName hn = "X-Custom-Field_1";
+        Assert.AreEqual(KnownHeader.Other, hn.Kind);
+        Assert.AreEqual("X-Custom-Field_1", hn.CustomName);
+    }
+
+    [TestMethod]
+    public void implicit_conversion_recognizes_known_name_case_insensitively_matches_rust()
+    {
+        HeaderName hn = "SUBJECT";
+        Assert.AreEqual(KnownHeader.Subject, hn.Kind);
+    }
+
+    [TestMethod]
+    public void stream_tokenizer_fallback_still_preserves_original_text_matches_rust()
+    {
+        // Regression guard for the exact bug introduced and caught while fixing the above:
+        // conflating HeaderName.parse(string?) with the public From<&str>-equivalent
+        // ParseHeaderName broke this (the 107-EML corpus caught it immediately). Must stay
+        // null on invalid input, NOT Other(""), so parsers/header.cs's own `?? Other(rawStr)`
+        // fallback fires and preserves the original text.
+        Assert.IsNull(HeaderName.parse("mal formed"));
+    }
+}
+#endif

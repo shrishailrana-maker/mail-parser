@@ -25,6 +25,23 @@ public static class HtmlUtils
 {
     private const char REPLACEMENT_CHARACTER = '\uFFFD';
 
+    // Rust: tag.eq_ignore_ascii_case(b"...") -- true ASCII case-insensitive matching,
+    // recognizing any casing ("br", "BR", "Br", "bR", ...). The prior code checked only
+    // two hardcoded variants (all-lowercase or all-uppercase) per tag, so any mixed-case
+    // form -- e.g. "<Style>" from Word/Outlook-generated HTML -- matched neither and was
+    // silently missed (PARITY-AUDIT.md FILE 12). `lower` must already be all-lowercase.
+    private static bool TagEqIgnoreAsciiCase(ReadOnlySpan<byte> tag, string lower)
+    {
+        if (tag.Length != lower.Length) return false;
+        for (int i = 0; i < tag.Length; i++)
+        {
+            byte b = tag[i];
+            if (b >= (byte)'A' && b <= (byte)'Z') b = (byte)(b + 32);
+            if (b != (byte)lower[i]) return false;
+        }
+        return true;
+    }
+
     public static uint? lookup_entity(string key)
     {
         return key switch
@@ -2266,27 +2283,26 @@ public static class HtmlUtils
                         if (tag_token_pos == 1)
                         {
                             var tag = inputBytes.AsSpan(token_start, token_end - token_start + 1);
-                            if (tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("br")) ||
-                                tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("BR")) ||
-                                (is_tag_close && (tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("p")) || tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("P")))))
+                            if (TagEqIgnoreAsciiCase(tag, "br") ||
+                                (is_tag_close && TagEqIgnoreAsciiCase(tag, "p")))
                             {
                                 result.Append('\n');
                                 is_after_space = false;
                                 is_new_line = true;
                             }
-                            else if (tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("head")) || tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("HEAD")))
+                            else if (TagEqIgnoreAsciiCase(tag, "head"))
                             {
                                 in_head = !is_tag_close;
                             }
-                            else if (tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("style")) || tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("STYLE")))
+                            else if (TagEqIgnoreAsciiCase(tag, "style"))
                             {
                                 in_style = !is_tag_close;
                             }
-                            else if (tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("script")) || tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("SCRIPT")))
+                            else if (TagEqIgnoreAsciiCase(tag, "script"))
                             {
                                 in_script = !is_tag_close;
                             }
-                            else if (tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("template")) || tag.SequenceEqual(System.Text.Encoding.ASCII.GetBytes("TEMPLATE")))
+                            else if (TagEqIgnoreAsciiCase(tag, "template"))
                             {
                                 in_template = !is_tag_close;
                             }
@@ -2499,6 +2515,20 @@ public class html_tests
         string output = HtmlUtils.html_to_text(input);
         Assert.IsFalse(output.Contains("body{color:red}"));
         Assert.IsTrue(output.Contains("Hello"));
+    }
+
+    [TestMethod]
+    public void html_to_text_mixed_case_tags_matches_rust()
+    {
+        // Rust: eq_ignore_ascii_case recognizes ANY casing, not just all-lower or
+        // all-upper -- mixed-case tags (common in Word/Outlook-generated HTML) must be
+        // recognized too (PARITY-AUDIT.md FILE 12).
+        string styleOutput = HtmlUtils.html_to_text("<Style>body{color:red}</Style><div>Hello</div>");
+        Assert.IsFalse(styleOutput.Contains("body{color:red}"), "mixed-case <Style> must be stripped");
+        Assert.IsTrue(styleOutput.Contains("Hello"));
+
+        string brOutput = HtmlUtils.html_to_text("one<Br>two");
+        Assert.AreEqual("one\ntwo", brOutput, "mixed-case <Br> must emit a newline");
     }
 
     [TestMethod]
