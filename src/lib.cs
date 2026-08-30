@@ -969,6 +969,18 @@ public partial struct HeaderName : IEquatable<HeaderName>
 
     public HeaderName(KnownHeader kind)
     {
+        // Rust: HeaderName::Other(Cow<str>) is an enum variant that cannot exist without
+        // its string payload -- there is no way to construct an Other with no name. This
+        // constructor let external callers do `new HeaderName(KnownHeader.Other)`, setting
+        // CustomName to null, which made Equals() violate reflexivity (x.Equals(x) ==
+        // false) since Equals's CustomName comparison treats null as "not equal to
+        // anything, including itself" (PARITY-AUDIT.md; Boss's own review caught this).
+        // Rejecting it here removes the invalid state at construction, matching Rust's
+        // structural guarantee, rather than papering over it in Equals/GetHashCode.
+        if (kind == KnownHeader.Other)
+        {
+            throw new ArgumentException($"{nameof(KnownHeader.Other)} requires a custom header name; use the HeaderName(string) constructor instead.", nameof(kind));
+        }
         Kind = kind;
         CustomName = null;
     }
@@ -1844,6 +1856,20 @@ public class lib_header_name_tests
         // null on invalid input, NOT Other(""), so parsers/header.cs's own `?? Other(rawStr)`
         // fallback fires and preserves the original text.
         Assert.IsNull(HeaderName.parse("mal formed"));
+    }
+
+    [TestMethod]
+    public void known_header_constructor_rejects_other_matches_rust_structural_guarantee()
+    {
+        // Rust: HeaderName::Other(Cow<str>) cannot exist without its string payload -- the
+        // enum variant structurally requires it. The C# struct previously let external
+        // callers do `new HeaderName(KnownHeader.Other)`, setting CustomName to null, which
+        // made Equals() violate reflexivity: x.Equals(x) returned false, since Equals's
+        // CustomName comparison treats null as "not equal to anything, including itself"
+        // (PARITY-AUDIT.md; Boss's own review caught this -- not exercised by any internal
+        // code path, but live on the public constructor surface). Fixed by rejecting the
+        // invalid state at construction instead of leaving it representable.
+        Assert.ThrowsExactly<ArgumentException>(() => new HeaderName(KnownHeader.Other));
     }
 }
 #endif
