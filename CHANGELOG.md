@@ -23,6 +23,9 @@ mail-parser 0.11.8 (C# port)
 - Fix: `HeaderName` equality/hashing used broader Unicode case-folding instead of Rust's ASCII-only comparison.
 - Fix: `HeaderValue.len()` counted UTF-16 characters instead of UTF-8 bytes for address and content-type values.
 - Fix: `maildir` folder traversal did not match Rust's actual recursive, prefix-gated discovery algorithm.
+- Fix: a missing/inaccessible `maildir` root or subdirectory was silently treated as an empty mailbox instead of raising an error, matching Rust's `fs::read_dir(path)?` hard-error behavior.
+- Fix: `maildir` flag-suffix parsing (`:2,FLAGS`) used Unicode-aware character classification instead of Rust's ASCII-only byte check, letting a non-ASCII byte incorrectly fail to stop flag parsing.
+- Fix: `HeaderName` could be constructed in a state that violated .NET's equality reflexivity contract (`x.Equals(x) == false`); the invalid state is now rejected at construction, matching Rust's structural guarantee.
 
 mail-parser 0.11.8
 ================================
